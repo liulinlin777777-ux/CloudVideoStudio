@@ -27,3 +27,7 @@ GitHub CI acceptance must be read from this PR's actual check and artifact, inde
 ## Reproduce
 
 Follow README setup, then run `python -m unittest discover -s tests -v`, `python tools/media_smoke.py --output-dir build/fresh-media`, and `python tools/candidate_smoke.py --output-dir build/fresh-candidates`. Use fresh output directories to preserve generated sources. CI uploads synthetic outputs and JSON evidence for seven days.
+
+## L3 learning acceptance
+
+The existing Skill and validated Archive case GH-REVISION-001 were actually read by a subsequent isolated execution. Retrieval was hash-bound and recorded before execution. The repaired source passed frozen tests and independent Sol review. Control and replay each used one attempt (41.195 s and 29.759 s execution time). This demonstrates actual case reuse; a single pair does not establish a general speed gain. [Sanitized metrics](evidence/learning-replay.json). The existing Skill was reused without speculative policy or version changes.

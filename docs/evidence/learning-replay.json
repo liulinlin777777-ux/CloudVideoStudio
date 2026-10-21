@@ -1,0 +1,26 @@
+{
+  "control": {
+    "attempts": 1,
+    "executionDurationMs": 41195,
+    "status": "PASS"
+  },
+  "replay": {
+    "attempts": 1,
+    "executionDurationMs": 29759,
+    "status": "PASS"
+  },
+  "readProof": [
+    {
+      "tool": "exec",
+      "toolInputSha256": "28a9976e24e95432a6af01a53f4f708b925bc7dcd39338383596504a8700849e",
+      "actualCaseRead": true,
+      "actualSkillRead": true
+    }
+  ],
+  "caseId": "GH-REVISION-001",
+  "fingerprint": "github-issue-body-revision-vs-comment-updated-at",
+  "confidence": "VALIDATED_SCOPED",
+  "scope": "Comment timestamp must not change a body-revision task key",
+  "generalPerformanceImprovement": "NOT_VERIFIED",
+  "skillVersionChanged": false
+}
