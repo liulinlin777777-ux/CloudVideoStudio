@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "otio_version": "0.18.1",
+  "otio_frames": 75,
+  "otio_rate": 29.97002997002997,
+  "mlt_version": "melt 7.42.0\nCopyright (C) 2002-2026 Meltytech, LLC\n<https://www.mltframework.org/>\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "mlt_decoded_frames": 60,
+  "mlt_fps": "30000/1001"
+}

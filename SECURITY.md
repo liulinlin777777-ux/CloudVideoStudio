@@ -2,7 +2,7 @@
 
 ## Project status
 
-CloudVideoStudio is at the planning and repository bootstrap stage. No application code or supported product releases are available yet.
+CloudVideoStudio contains an unreleased P0 technical prototype. No supported production product releases are available yet. The development preview binds only to loopback and accepts synthetic media in its configured directory; do not deploy it as a public service.
 
 ## Reporting a vulnerability
 

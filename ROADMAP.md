@@ -1,10 +1,10 @@
 # Roadmap
 
-This roadmap records planned project direction. It is not a statement that a capability is implemented, tested, or available. All stages below are **planned** as of this repository bootstrap.
+This roadmap records planned project direction. It is not a statement that a capability is implemented, tested, or available. P0 has a bounded prototype under PR verification; P1–P5 remain planned. See [P0 acceptance](docs/P0_ACCEPTANCE.md) and the actual CI check before inferring completion.
 
 | Stage | Planned focus | Status |
 | --- | --- | --- |
-| P0 | Core technology validation | Planned |
+| P0 | Core technology validation | Bounded prototype; PR/CI verification |
 | P1 | Professional editing foundation | Planned |
 | P2 | Professional post-production capabilities | Planned |
 | P3 | AI-assisted editing | Planned |

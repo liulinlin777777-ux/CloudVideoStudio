@@ -1,0 +1,39 @@
+name: P0 verification
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p0:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install public CPU media dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg melt
+          python -m pip install -e '.[interchange]'
+      - name: Unit tests and source build
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q src tools
+          python -m pip wheel --no-deps . --wheel-dir build/wheels
+      - name: Real multi-track render and plugin acceptance
+        run: python tools/media_smoke.py --output-dir build/media
+      - name: OTIO and MLT candidate verification
+        run: python tools/candidate_smoke.py --output-dir build/candidates
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: p0-public-synthetic-evidence
+          path: build/
+          retention-days: 7

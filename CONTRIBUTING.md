@@ -1,6 +1,6 @@
 # Contributing to CloudVideoStudio
 
-Thanks for helping shape the project. The repository is at its planning and bootstrap stage; its roadmap lists intended work, not completed features.
+Thanks for helping shape the project. The repository contains a bounded P0 technical prototype. Its roadmap distinguishes this baseline from future platform features.
 
 ## Ways to contribute
 
@@ -23,7 +23,7 @@ The `main` branch accepts changes through Pull Requests. No minimum approval cou
 
 ## Development checks
 
-There is no application code, build system, or test suite in the repository yet. If your contribution adds one, document the commands needed to run its relevant checks in the Pull Request.
+Use Python 3.12+ and run `python -m unittest discover -s tests -v`. Media changes also require `python tools/media_smoke.py --output-dir build/media` with FFmpeg/FFprobe installed. Use a fresh output directory for each run; input media is never overwritten. The P0 GitHub Actions job checks tests, wheel build, real media, OTIO and MLT. Document the results and limitations in your PR.
 
 ## Licensing
 

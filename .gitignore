@@ -30,3 +30,9 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Python build and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
