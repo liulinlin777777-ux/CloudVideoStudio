@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "browser": "Chrome",
+  "loopbackOnly": true,
+  "actions": [
+    "PIP and audio cue start 30 -> 36 frames",
+    "save project",
+    "reload restores 36",
+    "render job completed",
+    "decode and play until ended"
+  ],
+  "video": {
+    "width": 640,
+    "height": 360,
+    "duration": 4.004,
+    "readyState": 4,
+    "ended": true
+  },
+  "safari": "NOT_VERIFIED"
+}

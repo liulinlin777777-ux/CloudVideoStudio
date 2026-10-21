@@ -1,0 +1,356 @@
+"""FFmpeg-backed source generation and compilation for the bounded demo timeline."""
+
+from __future__ import annotations
+
+from fractions import Fraction
+import hashlib
+import math
+from pathlib import Path
+import resource
+import subprocess
+import time
+from typing import Any
+
+from .project import Asset, Clip, Effect, Project, Sequence, Track
+
+
+def make_demo_project() -> Project:
+    """Create the small, deterministic timeline used by the demo and tests."""
+    assets = [
+        Asset("red", "red.mp4", 150),
+        Asset("blue", "blue.mp4", 150),
+        Asset("green", "green.mp4", 150),
+        Asset("tone440", "tone440.wav", 150),
+        Asset("tone880", "tone880.wav", 150),
+    ]
+    sequence = Sequence(
+        id="demo-sequence",
+        width=640,
+        height=360,
+        fps_num=30000,
+        fps_den=1001,
+        tracks=[
+            Track(
+                "V1", "video",
+                [
+                    Clip("red-clip", "red", 0, 75, 15),
+                    Clip("blue-clip", "blue", 45, 75, 15,
+                         [Effect("crossfade", {"duration_frames": 30})]),
+                ],
+            ),
+            Track(
+                "V2", "video",
+                [Clip("green-clip", "green", 30, 60, 30,
+                      [Effect("pip", {"x": 460, "y": 250, "width": 160, "height": 90})])],
+            ),
+            Track("A1", "audio", [Clip("tone440-clip", "tone440", 0, 120, 15,
+                                         [Effect("volume", {"gain": 0.4})])]),
+            Track("A2", "audio", [Clip("tone880-clip", "tone880", 30, 60, 15,
+                                         [Effect("volume", {"gain": 0.25})])]),
+        ],
+    )
+    project = Project("demo-project", assets=assets, sequences=[sequence])
+    project.validate()
+    return project
+
+
+def _fraction_time(frames: int, sequence: Sequence) -> str:
+    value = sequence.frame_time(frames)
+    # All demo timeline boundaries are terminating decimals. Keep this exact;
+    # do not round a frame rate to an integer or approximate its frame times.
+    remainder = value.denominator
+    twos = fives = 0
+    while remainder % 2 == 0:
+        remainder //= 2
+        twos += 1
+    while remainder % 5 == 0:
+        remainder //= 5
+        fives += 1
+    if remainder != 1:
+        raise ValueError("timeline time cannot be represented exactly as an FFmpeg decimal")
+    # Decimal scaling through integer arithmetic avoids float formatting drift.
+    places = max(twos, fives)
+    scaled = value.numerator * (10 ** places) // value.denominator
+    whole, fractional = divmod(scaled, 10 ** places)
+    if not places:
+        return str(whole)
+    return f"{whole}.{fractional:0{places}d}".rstrip("0").rstrip(".")
+
+
+def _effect(clip: Clip, kind: str) -> Effect | None:
+    matches = [item for item in clip.effects if item.kind == kind]
+    if len(matches) > 1:
+        raise ValueError(f"clip {clip.id} has duplicate {kind} effects")
+    return matches[0] if matches else None
+
+
+def _finite_number(value: Any, name: str, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return float(value)
+
+
+def compile_timeline(project: Project) -> dict[str, Any]:
+    """Compile the explicitly supported two-video/two-audio demo topology."""
+    project.validate()
+    if len(project.sequences) != 1:
+        raise ValueError("exactly one sequence is supported")
+    sequence = project.sequences[0]
+    if len(sequence.tracks) != 4 or [track.kind for track in sequence.tracks] != [
+        "video", "video", "audio", "audio"
+    ]:
+        raise ValueError("supported topology is two video tracks followed by two audio tracks")
+    v1, v2, a1, a2 = sequence.tracks
+    if len(v1.clips) != 2 or len(v2.clips) != 1 or len(a1.clips) != 1 or len(a2.clips) != 1:
+        raise ValueError("supported topology requires video clips 2+1 and audio clips 1+1")
+    red, blue = v1.clips
+    green = v2.clips[0]
+    audio_clips = [a1.clips[0], a2.clips[0]]
+    if (red.start_frame, blue.start_frame) != (0, 45):
+        raise ValueError("unsupported video clip placement")
+    second_audio = audio_clips[1]
+    for clip, name in ((green, "green"), (second_audio, "second audio")):
+        if not 0 <= clip.start_frame <= 60:
+            raise ValueError(f"{name} clip start_frame must be between 0 and 60")
+        if clip.duration_frames != 60:
+            raise ValueError(f"{name} clip duration_frames must be 60")
+    if sequence.width > 1280 or sequence.height > 720:
+        raise ValueError("compile dimensions must not exceed 1280x720")
+
+    expected = {"crossfade": {"duration_frames"}, "pip": {"x", "y", "width", "height"}, "volume": {"gain"}}
+    for track in sequence.tracks:
+        for clip in track.clips:
+            for effect in clip.effects:
+                if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
+                    raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
+            if track.kind == "video":
+                allowed = {"crossfade"} if clip is blue else ({"pip"} if clip is green else set())
+            else:
+                allowed = {"volume"}
+            if any(effect.kind not in allowed for effect in clip.effects):
+                raise ValueError(f"effect is not supported on clip {clip.id}")
+
+    crossfade = _effect(blue, "crossfade")
+    pip = _effect(green, "pip")
+    if crossfade is None or pip is None:
+        raise ValueError("blue crossfade and green pip effects are required")
+    if isinstance(crossfade.parameters["duration_frames"], bool) or not isinstance(
+        crossfade.parameters["duration_frames"], int
+    ) or crossfade.parameters["duration_frames"] <= 0:
+        raise ValueError("crossfade duration_frames must be a positive integer")
+    overlap = crossfade.parameters["duration_frames"]
+    if overlap >= min(red.duration_frames, blue.duration_frames) or red.duration_frames - overlap != blue.start_frame:
+        raise ValueError("crossfade duration does not match the clip overlap")
+    coords = {}
+    for key, maximum in (("x", sequence.width), ("y", sequence.height), ("width", sequence.width), ("height", sequence.height)):
+        value = pip.parameters[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > maximum:
+            raise ValueError(f"pip {key} is outside the sequence")
+        coords[key] = value
+    if coords["width"] == 0 or coords["height"] == 0 or coords["x"] + coords["width"] > sequence.width or coords["y"] + coords["height"] > sequence.height:
+        raise ValueError("pip rectangle is outside the sequence")
+
+    gains = []
+    for clip in audio_clips:
+        volume = _effect(clip, "volume")
+        if volume is None:
+            raise ValueError("each audio clip requires a volume effect")
+        gains.append(_finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0))
+
+    by_id = {asset.id: asset for asset in project.assets}
+    used = [red.asset_id, blue.asset_id, green.asset_id, audio_clips[0].asset_id, audio_clips[1].asset_id]
+    if len(set(used)) != 5:
+        raise ValueError("demo timeline requires five distinct input assets")
+    if [by_id[item].id for item in used] != ["red", "blue", "green", "tone440", "tone880"]:
+        raise ValueError("assets must be ordered red, blue, green, tone440, tone880")
+
+    duration_frames = max(
+        clip.start_frame + clip.duration_frames
+        for track in sequence.tracks for clip in track.clips
+    )
+    if duration_frames != 120:
+        raise ValueError("supported timeline duration is 120 frames")
+    fps = f"{sequence.fps_num}/{sequence.fps_den}"
+    graph = [
+        f"[0:v]trim=start_frame={red.source_in_frame}:end_frame={red.source_in_frame + red.duration_frames},setpts=PTS-STARTPTS[vred]",
+        f"[1:v]trim=start_frame={blue.source_in_frame}:end_frame={blue.source_in_frame + blue.duration_frames},setpts=PTS-STARTPTS[vblue]",
+        f"[vred][vblue]xfade=transition=fade:duration={_fraction_time(overlap, sequence)}:offset={_fraction_time(blue.start_frame, sequence)}[base]",
+        f"[2:v]trim=start_frame={green.source_in_frame}:end_frame={green.source_in_frame + green.duration_frames},setpts=PTS-STARTPTS+{green.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,scale={coords['width']}:{coords['height']}[pip]",
+        f"[base][pip]overlay=x={coords['x']}:y={coords['y']}:eof_action=pass:shortest=0:format=auto[vout]",
+    ]
+    for index, clip in enumerate(audio_clips):
+        source_index = index + 3
+        delay_samples = Fraction(
+            clip.start_frame * sequence.fps_den * 48000, sequence.fps_num
+        )
+        delay_samples = (2 * delay_samples.numerator + delay_samples.denominator) // (
+            2 * delay_samples.denominator
+        )
+        clip_duration = _fraction_time(clip.duration_frames, sequence)
+        total_duration = _fraction_time(duration_frames, sequence)
+        graph.append(
+            f"[{source_index}:a]atrim=start={_fraction_time(clip.source_in_frame, sequence)}:duration={clip_duration},"
+            f"asetpts=PTS-STARTPTS,volume={gains[index]:g},adelay={delay_samples}S|{delay_samples}S,"
+            f"apad=whole_dur={total_duration},asetpts=N/SR/TB,atrim=duration={total_duration}[a{index}]"
+        )
+    graph.extend([
+        "[a0][a1]amix=inputs=2:duration=longest:normalize=0,"
+        f"atrim=duration={_fraction_time(duration_frames, sequence)}[aout]",
+    ])
+    return {
+        "inputs": used,
+        "filtergraph": ";".join(graph),
+        "duration_frames": duration_frames,
+        "fps": fps,
+        "width": sequence.width,
+        "height": sequence.height,
+    }
+
+
+def generate_sources(root: str | Path, ffmpeg: str = "ffmpeg") -> dict[str, Path]:
+    """Create the five deterministic lavfi demo inputs, refusing replacements."""
+    directory = Path(root).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    targets = {
+        "red": directory / "red.mp4",
+        "blue": directory / "blue.mp4",
+        "green": directory / "green.mp4",
+        "tone440": directory / "tone440.wav",
+        "tone880": directory / "tone880.wav",
+    }
+    existing = [path for path in targets.values() if path.exists()]
+    if existing:
+        raise FileExistsError(f"source target already exists: {existing[0].name}")
+    colors = {"red": "red", "blue": "blue", "green": "green"}
+    for asset_id, color in colors.items():
+        command = [
+            ffmpeg, "-nostdin", "-n", "-f", "lavfi", "-i",
+            f"color=c={color}:s=640x360:r=30000/1001:d=5.005",
+            "-frames:v", "150", "-an", "-c:v", "libx264", "-preset", "fast",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-threads", "2", str(targets[asset_id]),
+        ]
+        _run_checked(command, timeout=30, operation=f"generate {asset_id}")
+    for asset_id, frequency in (("tone440", 440), ("tone880", 880)):
+        command = [
+            ffmpeg, "-nostdin", "-n", "-f", "lavfi", "-i",
+            f"sine=frequency={frequency}:sample_rate=48000:duration=5.005",
+            "-c:a", "pcm_s16le", "-threads", "2", str(targets[asset_id]),
+        ]
+        _run_checked(command, timeout=30, operation=f"generate {asset_id}")
+    return targets
+
+
+def _run_checked(command: list[str], timeout: float | None, operation: str) -> subprocess.CompletedProcess:
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{operation} timed out") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"{operation} failed: {result.stderr.strip()}")
+    return result
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _inside_root(path: Path, root: Path, name: str) -> Path:
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{name} must stay inside the render root") from exc
+    return resolved
+
+
+def render_project(
+    project: Project,
+    root: str | Path,
+    output: str | Path,
+    ffmpeg: str = "ffmpeg",
+    timeout: float = 120,
+) -> dict[str, Any]:
+    """Render a project to a new file inside root and verify inputs stayed intact."""
+    if (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        or isinstance(timeout, float) and not math.isfinite(timeout)
+        or not 0 < timeout <= 120
+    ):
+        raise ValueError("render timeout must be finite and greater than 0 through 120 seconds")
+    compiled = compile_timeline(project)
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise ValueError("render root must be an existing directory")
+    assets = {asset.id: asset for asset in project.assets}
+    source_paths: dict[str, Path] = {}
+    for asset_id in compiled["inputs"]:
+        uri = Path(assets[asset_id].uri)
+        if uri.is_absolute():
+            raise ValueError("asset URIs must be relative to the render root")
+        source = _inside_root(root_path / uri, root_path, "asset source")
+        if not source.is_file():
+            raise ValueError(f"asset source does not exist: {assets[asset_id].uri}")
+        source_paths[asset_id] = source
+    target = Path(output)
+    if not target.is_absolute():
+        target = root_path / target
+    target = _inside_root(target, root_path, "render output")
+    for source in source_paths.values():
+        if source == target:
+            raise ValueError("render output aliases a source asset")
+        if target.exists():
+            try:
+                source_stat, target_stat = source.stat(), target.stat()
+            except FileNotFoundError:
+                continue
+            if (source_stat.st_dev, source_stat.st_ino) == (target_stat.st_dev, target_stat.st_ino):
+                raise ValueError("render output hardlinks a source asset")
+    if target.exists():
+        raise FileExistsError("render output already exists")
+
+    hashes_before = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
+    command = [ffmpeg, "-nostdin", "-n"]
+    for asset_id in compiled["inputs"]:
+        command.extend(["-i", str(source_paths[asset_id])])
+    command.extend([
+        "-filter_complex_threads", "1", "-filter_complex", compiled["filtergraph"],
+        "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
+        "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-t", _fraction_time(compiled["duration_frames"], project.sequences[0]),
+        "-movflags", "+faststart", str(target),
+    ])
+    before_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("FFmpeg render timed out") from exc
+    wall_seconds = time.monotonic() - started
+    after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg render failed: {result.stderr.strip()}")
+    if not target.is_file() or target.stat().st_size <= 0:
+        raise RuntimeError("FFmpeg produced an empty output")
+    hashes_after = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
+    if hashes_after != hashes_before:
+        raise RuntimeError("FFmpeg modified one or more source assets")
+    cpu_seconds = (
+        after_cpu.ru_utime + after_cpu.ru_stime - before_cpu.ru_utime - before_cpu.ru_stime
+    )
+    return {
+        "status": "completed",
+        "wall_seconds": wall_seconds,
+        "cpu_seconds": max(0.0, cpu_seconds),
+        "output_bytes": target.stat().st_size,
+        "source_hashes_before": hashes_before,
+        "source_hashes_after": hashes_after,
+    }

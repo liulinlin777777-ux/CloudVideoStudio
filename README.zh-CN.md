@@ -4,36 +4,36 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-CloudVideoStudio 是一个开源项目，计划构建云原生 AI 视频编辑平台，目标包括专业时间线剪辑、模块化工作流、AI 生成、数字人和可扩展插件。
+CloudVideoStudio 是开源的云原生 AI 视频编辑项目。当前实现是 **P0 CPU 技术原型**：
+版本化工程模型、有理数帧率、限定的两条视频轨和两条音轨、真实 FFmpeg 渲染、
+受信任的代理媒体插件，以及本机回环预览。AI 剪辑、视频生成、数字人和专业工作台
+仍属规划能力，当前并非生产平台发行版。
 
-> **项目状态：规划与仓库初始化阶段。** 当前仓库只有项目治理和规划文档。本文及路线图所述能力均为目标，尚未实现或验证。
+## 运行技术基线
 
-## 项目目标
+需要 Python 3.12+、支持 libx264/AAC 的 FFmpeg/FFprobe；候选验证另需 MLT 的 `melt`。
+实际验证版本和许可证见 [DEPENDENCIES.md](docs/DEPENDENCIES.md)。
 
-- 探索支持协作视频制作的云原生基础。
-- 规划专业非线性编辑体验和后期制作工具。
-- 开发用于 AI 辅助剪辑与媒体生成的模块化工作流。
-- 通过插件扩展外部集成能力。
+```sh
+python -m pip install -e '.[interchange]'
+python -m unittest discover -s tests -v
+python tools/media_smoke.py --output-dir build/media
+python tools/candidate_smoke.py --output-dir build/candidates
+python tools/preview_server.py --media-root build/media
+```
 
-这些是项目目标，不代表当前功能。仓库暂不包含应用代码或可运行产品。
+打开 `http://127.0.0.1:8774` 查看合成素材预览。原型支持 640×360、30000/1001 fps、
+120 帧的固定拓扑，包括裁切、交叉转场、画中画、双音轨混音、帧偏移编辑、工程保存/加载和
+CPU 渲染回执。不支持的轨道拓扑和效果会被明确拒绝，原始素材保持不变。
 
-## 路线图
+独立媒体烟测会真实解码成片，检查关键帧颜色、转场和叠加位置，测量两个音频频率及
+音画事件起点，并运行真实代理插件的正常、超时和错误路径。CI 保存可下载的公开合成证据。
 
-开发计划分为 P0–P5 阶段。目前所有阶段均为**计划中**，具体范围和状态见 [ROADMAP.md](ROADMAP.md)。
+## 项目方向
 
-| 阶段 | 计划方向 | 状态 |
-| --- | --- | --- |
-| P0 | 核心技术验证 | 计划中 |
-| P1 | 专业剪辑底座 | 计划中 |
-| P2 | 专业后期能力 | 计划中 |
-| P3 | AI 智能剪辑 | 计划中 |
-| P4 | AI 视频生成及数字人 | 计划中 |
-| P5 | 云端批量生产与运营 | 计划中 |
+P0–P5 方向见 [ROADMAP.md](ROADMAP.md)。Safari、4K/GPU、专业工作台和已发布的
+Codex Cloud 运行环境保持未验证。项目没有新增付费基础设施，也不承诺全天持续运行。
 
-## 参与贡献
-
-欢迎社区通过 Issue、Discussions 和 Pull Request 参与。请先阅读[贡献指南](CONTRIBUTING.md)，并遵守[行为准则](CODE_OF_CONDUCT.md)。
-
-## 安全与许可证
-
-报告漏洞前请阅读 [SECURITY.md](SECURITY.md)。项目原创贡献采用 [MIT 许可证](LICENSE)。第三方组件保留各自的许可证和署名；新增依赖前必须审查许可证兼容性。
+欢迎通过 Issue、Discussions 和 Pull Request 参与贡献。请阅读[贡献指南](CONTRIBUTING.md)、
+[行为准则](CODE_OF_CONDUCT.md)与[安全政策](SECURITY.md)。原创代码采用 [MIT](LICENSE)，
+第三方组件保留各自许可证。本仓库不包含 FFmpeg/MLT 二进制或第三方源码副本。

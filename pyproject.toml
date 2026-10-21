@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-video-studio"
+version = "0.0.1"
+description = "P0 technical baseline for CloudVideoStudio"
+requires-python = ">=3.12"
+license = "MIT"
+
+[project.optional-dependencies]
+interchange = ["opentimelineio==0.18.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
