@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Project discussions
+    url: https://github.com/liulinlin777777-ux/CloudVideoStudio/discussions
+    about: Ask open-ended questions or discuss technical proposals.
+  - name: Security reporting guidance
+    url: https://github.com/liulinlin777777-ux/CloudVideoStudio/blob/main/SECURITY.md
+    about: Read the private vulnerability reporting instructions before sharing security details.

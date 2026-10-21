@@ -1,0 +1,32 @@
+# Local workspace and generated files
+/work/
+/outputs/
+/build/
+/dist/
+/coverage/
+/tmp/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Local media and caches
+/local-media/
+/private-media/
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+Thumbs.db
+
+# Common editor state
+.idea/
+.vscode/
+*.swp
+*.swo

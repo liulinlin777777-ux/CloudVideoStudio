@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem in the repository or project tooling.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Please do not include credentials, private data, or unlicensed media. Use the private reporting route in SECURITY.md for security issues."
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands and expected versus actual behavior where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include relevant OS and tool versions. Redact sensitive values.
+    validations:
+      required: false

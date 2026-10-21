@@ -1,0 +1,29 @@
+name: Feature or technical proposal
+description: Suggest a project capability, technical direction, plugin, or improvement.
+title: "[Proposal]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: "For open-ended discussion, you can also use GitHub Discussions. Roadmap items are plans, not shipped features."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What need would this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: Describe the idea and any relevant trade-offs.
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: References and licensing
+      description: Link relevant work and identify any proposed external code, assets, or dependencies.
+    validations:
+      required: false
