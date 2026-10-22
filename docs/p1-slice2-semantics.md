@@ -1,0 +1,9 @@
+# P1 slice 2: bounded timeline semantics (frozen before implementation)
+- Keep Project schema and the move/trim implementation from slice 1 unchanged.
+- Exactly one sequence, ordered track kinds 2V/2A; primary V1 exactly two clips, V2 one PIP clip, A1/A2 one clip each. Deterministically sort V1 by (start_frame,id); source asset list order and names have no semantic role. Five distinct used assets. No arbitrary input graph.
+- Rates exactly 30000/1001 or 25/1; dimensions at most 1280x720; total max end <=300 frames. Every source range is validated by existing Project.validate. Sequence duration is maximum clip end across all four tracks.
+- V1 initial delay and gaps are opaque black. Abutting/gapped clips have no crossfade effect. An overlap must have exactly one crossfade on the later clip; duration_frames must equal overlap, be positive and strictly shorter than either clip. First clip cannot carry effects. Coincident starts/full containment are rejected.
+- PIP requires a single valid in-bounds integer rectangle and is visible only on [start,end), with trimmed source and project fps. Base continues black if needed until total duration.
+- Audio requires volume gain finite [0,1]; trim source in project frame-time, delay at nearest 48kHz sample, silence outside clip, mix without normalization, truncate/pad to total duration. All four track timings are data-driven. Unknown/duplicate/misplaced effects are rejected before FFmpeg.
+- Do not mutate project/source assets. Reuse existing FFmpeg render safety, source hash protection, timeout and CPU bounds. Do not modify tests, plugins, Project, UI, dependencies or deployment.
+- Independent frozen unit tests before implementation; real synthetic 2V2A gap and overlap cases at both rates plus unchanged P0 acceptance are required before delivery. Product P1 remains incomplete until separate browser slice 3.

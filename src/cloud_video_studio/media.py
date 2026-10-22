@@ -107,19 +107,20 @@ def compile_timeline(project: Project) -> dict[str, Any]:
     v1, v2, a1, a2 = sequence.tracks
     if len(v1.clips) != 2 or len(v2.clips) != 1 or len(a1.clips) != 1 or len(a2.clips) != 1:
         raise ValueError("supported topology requires video clips 2+1 and audio clips 1+1")
-    red, blue = v1.clips
-    green = v2.clips[0]
-    audio_clips = [a1.clips[0], a2.clips[0]]
-    if (red.start_frame, blue.start_frame) != (0, 45):
-        raise ValueError("unsupported video clip placement")
-    second_audio = audio_clips[1]
-    for clip, name in ((green, "green"), (second_audio, "second audio")):
-        if not 0 <= clip.start_frame <= 60:
-            raise ValueError(f"{name} clip start_frame must be between 0 and 60")
-        if clip.duration_frames != 60:
-            raise ValueError(f"{name} clip duration_frames must be 60")
+    if (sequence.fps_num, sequence.fps_den) not in ((30000, 1001), (25, 1)):
+        raise ValueError("supported frame rates are 30000/1001 and 25/1")
     if sequence.width > 1280 or sequence.height > 720:
         raise ValueError("compile dimensions must not exceed 1280x720")
+
+    primary = sorted(v1.clips, key=lambda clip: (clip.start_frame, clip.id))
+    first, later = primary
+    pip_clip = v2.clips[0]
+    audio_clips = [a1.clips[0], a2.clips[0]]
+    if first.start_frame == later.start_frame:
+        raise ValueError("primary video clips cannot have coincident starts")
+    overlap = first.start_frame + first.duration_frames - later.start_frame
+    if overlap >= min(first.duration_frames, later.duration_frames):
+        raise ValueError("primary video clips cannot fully contain one another")
 
     expected = {"crossfade": {"duration_frames"}, "pip": {"x", "y", "width", "height"}, "volume": {"gain"}}
     for track in sequence.tracks:
@@ -127,24 +128,27 @@ def compile_timeline(project: Project) -> dict[str, Any]:
             for effect in clip.effects:
                 if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
                     raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
-            if track.kind == "video":
-                allowed = {"crossfade"} if clip is blue else ({"pip"} if clip is green else set())
-            else:
-                allowed = {"volume"}
-            if any(effect.kind not in allowed for effect in clip.effects):
-                raise ValueError(f"effect is not supported on clip {clip.id}")
+    if first.effects:
+        raise ValueError("the first primary video clip cannot carry effects")
+    first_crossfade = _effect(later, "crossfade")
+    if overlap > 0:
+        if first_crossfade is None:
+            raise ValueError("an overlapping primary clip requires a crossfade")
+        value = first_crossfade.parameters["duration_frames"]
+        if isinstance(value, bool) or not isinstance(value, int) or value != overlap:
+            raise ValueError("crossfade duration_frames must equal the clip overlap")
+        if value <= 0 or value >= min(first.duration_frames, later.duration_frames):
+            raise ValueError("crossfade duration must be positive and shorter than either clip")
+    elif first_crossfade is not None:
+        raise ValueError("a crossfade is only valid for overlapping primary clips")
+    if any(effect.kind != "crossfade" for effect in later.effects):
+        raise ValueError("only the later primary clip may carry a crossfade")
 
-    crossfade = _effect(blue, "crossfade")
-    pip = _effect(green, "pip")
-    if crossfade is None or pip is None:
-        raise ValueError("blue crossfade and green pip effects are required")
-    if isinstance(crossfade.parameters["duration_frames"], bool) or not isinstance(
-        crossfade.parameters["duration_frames"], int
-    ) or crossfade.parameters["duration_frames"] <= 0:
-        raise ValueError("crossfade duration_frames must be a positive integer")
-    overlap = crossfade.parameters["duration_frames"]
-    if overlap >= min(red.duration_frames, blue.duration_frames) or red.duration_frames - overlap != blue.start_frame:
-        raise ValueError("crossfade duration does not match the clip overlap")
+    pip = _effect(pip_clip, "pip")
+    if pip is None:
+        raise ValueError("the picture-in-picture clip requires a pip effect")
+    if len(pip_clip.effects) != 1:
+        raise ValueError("the picture-in-picture clip only supports one pip effect")
     coords = {}
     for key, maximum in (("x", sequence.width), ("y", sequence.height), ("width", sequence.width), ("height", sequence.height)):
         value = pip.parameters[key]
@@ -159,47 +163,90 @@ def compile_timeline(project: Project) -> dict[str, Any]:
         volume = _effect(clip, "volume")
         if volume is None:
             raise ValueError("each audio clip requires a volume effect")
+        if len(clip.effects) != 1:
+            raise ValueError("audio clips only support one volume effect")
         gains.append(_finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0))
 
-    by_id = {asset.id: asset for asset in project.assets}
-    used = [red.asset_id, blue.asset_id, green.asset_id, audio_clips[0].asset_id, audio_clips[1].asset_id]
+    used = [first.asset_id, later.asset_id, pip_clip.asset_id, audio_clips[0].asset_id, audio_clips[1].asset_id]
     if len(set(used)) != 5:
         raise ValueError("demo timeline requires five distinct input assets")
-    if [by_id[item].id for item in used] != ["red", "blue", "green", "tone440", "tone880"]:
-        raise ValueError("assets must be ordered red, blue, green, tone440, tone880")
 
     duration_frames = max(
         clip.start_frame + clip.duration_frames
         for track in sequence.tracks for clip in track.clips
     )
-    if duration_frames != 120:
-        raise ValueError("supported timeline duration is 120 frames")
+    if duration_frames > 300:
+        raise ValueError("timeline duration must not exceed 300 frames")
     fps = f"{sequence.fps_num}/{sequence.fps_den}"
     graph = [
-        f"[0:v]trim=start_frame={red.source_in_frame}:end_frame={red.source_in_frame + red.duration_frames},setpts=PTS-STARTPTS[vred]",
-        f"[1:v]trim=start_frame={blue.source_in_frame}:end_frame={blue.source_in_frame + blue.duration_frames},setpts=PTS-STARTPTS[vblue]",
-        f"[vred][vblue]xfade=transition=fade:duration={_fraction_time(overlap, sequence)}:offset={_fraction_time(blue.start_frame, sequence)}[base]",
-        f"[2:v]trim=start_frame={green.source_in_frame}:end_frame={green.source_in_frame + green.duration_frames},setpts=PTS-STARTPTS+{green.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,scale={coords['width']}:{coords['height']}[pip]",
-        f"[base][pip]overlay=x={coords['x']}:y={coords['y']}:eof_action=pass:shortest=0:format=auto[vout]",
+        f"color=c=black:s={sequence.width}x{sequence.height}:r={fps},trim=end_frame={duration_frames},setpts=PTS-STARTPTS,format=yuv420p[vblack]"
     ]
+    input_index = {asset_id: index for index, asset_id in enumerate(used)}
+
+    def video_stream(clip: Clip, label: str, *, size: str, timeline_start: bool = True) -> str:
+        index = input_index[clip.asset_id]
+        start = clip.start_frame if timeline_start else 0
+        graph.append(
+            f"[{index}:v]trim=start_frame={clip.source_in_frame}:end_frame={clip.source_in_frame + clip.duration_frames},"
+            f"setpts=PTS-STARTPTS+{start}*{sequence.fps_den}/{sequence.fps_num}/TB,"
+            f"scale={size},setsar=1,fps={fps},format=yuv420p[{label}]"
+        )
+        return label
+
+    def filter_time(frames: int) -> str:
+        # FFmpeg duration options have microsecond precision. Convert the exact
+        # frame Fraction at this boundary; the supported frame periods are far
+        # larger than the resulting sub-microsecond representation error.
+        value = sequence.frame_time(frames) * 1_000_000
+        micros = (2 * value.numerator + value.denominator) // (2 * value.denominator)
+        whole, fractional = divmod(micros, 1_000_000)
+        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
+
+    first_label = video_stream(first, "vfirst", size=f"{sequence.width}:{sequence.height}")
+    graph.append(f"[vblack][{first_label}]overlay=eof_action=pass:shortest=0:format=auto[vfirstlayer]")
+    if overlap > 0:
+        later_label = video_stream(
+            later, "vlater", size=f"{sequence.width}:{sequence.height}", timeline_start=False
+        )
+        graph.append(
+            f"[vfirstlayer][{later_label}]xfade=transition=fade:"
+            f"duration={filter_time(overlap)}:offset={filter_time(later.start_frame)}[vprimary]"
+        )
+        graph.append("[vblack][vprimary]overlay=eof_action=pass:shortest=0:format=auto[vbase]")
+    else:
+        later_label = video_stream(later, "vlater", size=f"{sequence.width}:{sequence.height}")
+        graph.append(
+            f"[vfirstlayer][{later_label}]overlay=eof_action=pass:shortest=0:format=auto:"
+            f"enable='gte(n,{later.start_frame})*lt(n,{later.start_frame + later.duration_frames})'[vbase]"
+        )
+
+    pip_label = video_stream(pip_clip, "vpip", size=f"{coords['width']}:{coords['height']}")
+    graph.append(
+        f"[vbase][{pip_label}]overlay=x={coords['x']}:y={coords['y']}:eof_action=pass:shortest=0:"
+        f"format=auto:enable='gte(n,{pip_clip.start_frame})*lt(n,{pip_clip.start_frame + pip_clip.duration_frames})'[vout]"
+    )
     for index, clip in enumerate(audio_clips):
-        source_index = index + 3
+        source_index = input_index[clip.asset_id]
         delay_samples = Fraction(
             clip.start_frame * sequence.fps_den * 48000, sequence.fps_num
         )
         delay_samples = (2 * delay_samples.numerator + delay_samples.denominator) // (
             2 * delay_samples.denominator
         )
-        clip_duration = _fraction_time(clip.duration_frames, sequence)
-        total_duration = _fraction_time(duration_frames, sequence)
+        source_start = Fraction(clip.source_in_frame * sequence.fps_den * 48000, sequence.fps_num)
+        source_start = (2 * source_start.numerator + source_start.denominator) // (2 * source_start.denominator)
+        source_end = Fraction((clip.source_in_frame + clip.duration_frames) * sequence.fps_den * 48000, sequence.fps_num)
+        source_end = (2 * source_end.numerator + source_end.denominator) // (2 * source_end.denominator)
         graph.append(
-            f"[{source_index}:a]atrim=start={_fraction_time(clip.source_in_frame, sequence)}:duration={clip_duration},"
-            f"asetpts=PTS-STARTPTS,volume={gains[index]:g},adelay={delay_samples}S|{delay_samples}S,"
-            f"apad=whole_dur={total_duration},asetpts=N/SR/TB,atrim=duration={total_duration}[a{index}]"
+            f"[{source_index}:a]aresample=48000,atrim=start_sample={source_start}:end_sample={source_end},"
+            f"asetpts=N/SR/TB,volume={gains[index]:g},adelay={delay_samples}S|{delay_samples}S,"
+            f"apad,atrim=end_sample={round(Fraction(duration_frames * sequence.fps_den * 48000, sequence.fps_num))},"
+            f"asetpts=N/SR/TB[a{index}]"
         )
     graph.extend([
         "[a0][a1]amix=inputs=2:duration=longest:normalize=0,"
-        f"atrim=duration={_fraction_time(duration_frames, sequence)}[aout]",
+        f"atrim=end_sample={round(Fraction(duration_frames * sequence.fps_den * 48000, sequence.fps_num))},"
+        "asetpts=N/SR/TB[aout]",
     ])
     return {
         "inputs": used,
@@ -325,7 +372,7 @@ def render_project(
         "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
         "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-t", _fraction_time(compiled["duration_frames"], project.sequences[0]),
+        "-c:a", "aac",
         "-movflags", "+faststart", str(target),
     ])
     before_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
