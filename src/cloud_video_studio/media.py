@@ -221,14 +221,14 @@ def compile_timeline(project: Project) -> dict[str, Any]:
     else:
         later_label = video_stream(later, "vlater", size=f"{sequence.width}:{sequence.height}")
         graph.append(
-            f"[vfirstlayer][{later_label}]overlay=eof_action=pass:shortest=0:format=auto:"
-            f"enable='gte(n,{later.start_frame})*lt(n,{later.start_frame + later.duration_frames})'[vbase]"
+            f"[vfirstlayer][{later_label}]overlay=eof_action=pass:shortest=0:format=auto"
+            f"[vbase]"
         )
 
     pip_label = video_stream(pip_clip, "vpip", size=f"{coords['width']}:{coords['height']}")
     graph.append(
         f"[vbase][{pip_label}]overlay=x={coords['x']}:y={coords['y']}:eof_action=pass:shortest=0:"
-        f"format=auto:enable='gte(n,{pip_clip.start_frame})*lt(n,{pip_clip.start_frame + pip_clip.duration_frames})'[vout]"
+        f"format=auto[vout]"
     )
     for index, clip in enumerate(audio_clips):
         source_index = input_index[clip.asset_id]
