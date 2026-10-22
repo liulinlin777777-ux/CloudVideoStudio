@@ -181,6 +181,11 @@ def compile_timeline(project: Project) -> dict[str, Any]:
     graph = [
         f"color=c=black:s={sequence.width}x{sequence.height}:r={fps},trim=end_frame={duration_frames},setpts=PTS-STARTPTS,format=yuv420p[vblack]"
     ]
+    if overlap > 0:
+        graph.append("[vblack]split=2[vblackfirst][vblackprimary]")
+        first_black, primary_black = "vblackfirst", "vblackprimary"
+    else:
+        first_black = "vblack"
     input_index = {asset_id: index for index, asset_id in enumerate(used)}
 
     def video_stream(clip: Clip, label: str, *, size: str, timeline_start: bool = True) -> str:
@@ -203,7 +208,7 @@ def compile_timeline(project: Project) -> dict[str, Any]:
         return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
 
     first_label = video_stream(first, "vfirst", size=f"{sequence.width}:{sequence.height}")
-    graph.append(f"[vblack][{first_label}]overlay=eof_action=pass:shortest=0:format=auto[vfirstlayer]")
+    graph.append(f"[{first_black}][{first_label}]overlay=eof_action=pass:shortest=0:format=auto[vfirstlayer]")
     if overlap > 0:
         later_label = video_stream(
             later, "vlater", size=f"{sequence.width}:{sequence.height}", timeline_start=False
@@ -212,7 +217,7 @@ def compile_timeline(project: Project) -> dict[str, Any]:
             f"[vfirstlayer][{later_label}]xfade=transition=fade:"
             f"duration={filter_time(overlap)}:offset={filter_time(later.start_frame)}[vprimary]"
         )
-        graph.append("[vblack][vprimary]overlay=eof_action=pass:shortest=0:format=auto[vbase]")
+        graph.append(f"[{primary_black}][vprimary]overlay=eof_action=pass:shortest=0:format=auto[vbase]")
     else:
         later_label = video_stream(later, "vlater", size=f"{sequence.width}:{sequence.height}")
         graph.append(
