@@ -202,8 +202,10 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             out_width = pip.parameters["width"] if pip else sequence.width
             out_height = pip.parameters["height"] if pip else sequence.height
             graph.append(
-                f"[{indexes[clip.asset_id]}:v]trim=start_frame={clip.source_in_frame}:"
-                f"end_frame={clip.source_in_frame + clip.duration_frames},setpts=PTS-STARTPTS+"
+                f"[{indexes[clip.asset_id]}:v]fps={fps},"
+                f"trim=start_frame={clip.source_in_frame}:"
+                f"end_frame={clip.source_in_frame + clip.duration_frames},"
+                f"setpts=N*{sequence.fps_den}/{sequence.fps_num}/TB+"
                 f"{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
                 f"scale={out_width}:{out_height},setsar=1,fps={fps},"
                 f"format=yuva420p[{label}]"

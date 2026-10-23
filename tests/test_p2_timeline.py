@@ -2,6 +2,7 @@
 import copy
 import unittest
 from fractions import Fraction
+from pathlib import Path
 
 from cloud_video_studio.media import compile_timeline
 from cloud_video_studio.project import Asset, Clip, Project, Sequence, Track
@@ -31,6 +32,23 @@ class BoundedTimelineTests(unittest.TestCase):
         self.assertEqual(compiled["fps"], "25/1")
         self.assertEqual(project.to_dict(), before)
         self.assertIn("[vout]", compiled["filtergraph"])
+
+    def test_extensible_video_trims_on_target_frame_lattice(self):
+        compiled = compile_timeline(sample_project())
+        graph = compiled["filtergraph"]
+        self.assertIn(
+            "[0:v]fps=25/1,trim=start_frame=0:end_frame=100,"
+            "setpts=N*1/25/TB+0*1/25/TB,",
+            graph,
+        )
+
+    def test_drag_handler_moves_the_dragged_clip_id(self):
+        page = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text()
+        self.assertIn(
+            "await apply('move',{start_frame:Math.max(0,startFrame+delta),"
+            "track_id:target,snap_frames:integerInput('snap')},clip.id)",
+            page,
+        )
 
     def test_schema_one_round_trip_and_exact_rational_time(self):
         project = sample_project()
