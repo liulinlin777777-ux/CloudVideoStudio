@@ -94,9 +94,178 @@ def _finite_number(value: Any, name: str, low: float, high: float) -> float:
     return float(value)
 
 
+def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
+    """Compile the bounded P2 multi-track subset; unknown effect graphs fail closed."""
+    if len(project.sequences) != 1:
+        raise ValueError("exactly one sequence is supported")
+    sequence = project.sequences[0]
+    if not (1 <= len(sequence.tracks) <= 8):
+        raise ValueError("a sequence requires one through eight tracks")
+    if (sequence.fps_num, sequence.fps_den) not in ((30000, 1001), (25, 1)):
+        raise ValueError("supported frame rates are 30000/1001 and 25/1")
+    if sequence.width > 1280 or sequence.height > 720:
+        raise ValueError("compile dimensions must not exceed 1280x720")
+    all_clips = [clip for track in sequence.tracks for clip in track.clips]
+    if not 1 <= len(all_clips) <= 20:
+        raise ValueError("a sequence requires one through twenty media clips")
+    duration_frames = max(clip.start_frame + clip.duration_frames for clip in all_clips)
+    max_duration_frames = (60 * sequence.fps_num + sequence.fps_den - 1) // sequence.fps_den
+    if duration_frames > max_duration_frames:
+        raise ValueError("timeline duration must not exceed 60 seconds")
+
+    expected = {
+        "crossfade": {"duration_frames"},
+        "pip": {"x", "y", "width", "height"},
+        "volume": {"gain"},
+    }
+    for track in sequence.tracks:
+        if track.kind not in {"video", "audio"}:
+            raise ValueError("unsupported track kind")
+        ordered = sorted(track.clips, key=lambda item: (item.start_frame, item.id))
+        if track.kind == "audio" and any(_effect(clip, "pip") or _effect(clip, "crossfade") for clip in ordered):
+            raise ValueError("audio tracks do not support video effects")
+        for index, later in enumerate(ordered):
+            overlaps = [
+                previous for previous in ordered[:index]
+                if previous.start_frame + previous.duration_frames > later.start_frame
+            ]
+            crossfade = _effect(later, "crossfade")
+            if overlaps:
+                if len(overlaps) != 1 or overlaps[0] is not ordered[index - 1]:
+                    raise ValueError("a clip may overlap only its immediate predecessor")
+                previous = overlaps[0]
+                overlap = previous.start_frame + previous.duration_frames - later.start_frame
+                if crossfade is None:
+                    raise ValueError("overlapping clips require a crossfade effect on the later clip")
+                frames = crossfade.parameters.get("duration_frames")
+                if isinstance(frames, bool) or not isinstance(frames, int) or frames != overlap:
+                    raise ValueError("crossfade duration_frames must equal the overlap")
+                if frames >= min(previous.duration_frames, later.duration_frames):
+                    raise ValueError("crossfade must be shorter than either clip")
+            elif crossfade is not None:
+                raise ValueError("crossfade is only valid on an overlapping clip")
+        for clip in ordered:
+            kinds = [effect.kind for effect in clip.effects]
+            if len(kinds) != len(set(kinds)):
+                raise ValueError(f"clip {clip.id} has duplicate effects")
+            for effect in clip.effects:
+                if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
+                    raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
+                if track.kind == "audio" and effect.kind != "volume":
+                    raise ValueError("audio clips only support volume")
+                if track.kind == "video" and effect.kind == "volume":
+                    raise ValueError("video clips do not support volume")
+            pip = _effect(clip, "pip")
+            if pip is not None:
+                values = {}
+                for key, maximum in (("x", sequence.width), ("y", sequence.height),
+                                     ("width", sequence.width), ("height", sequence.height)):
+                    value = pip.parameters[key]
+                    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                        raise ValueError(f"pip {key} is outside the sequence")
+                    values[key] = value
+                if (not values["width"] or not values["height"] or
+                        values["x"] + values["width"] > sequence.width or
+                        values["y"] + values["height"] > sequence.height):
+                    raise ValueError("pip rectangle is outside the sequence")
+            if track.kind == "audio":
+                volume = _effect(clip, "volume")
+                if volume is not None:
+                    _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0)
+
+    inputs = list(dict.fromkeys(clip.asset_id for clip in all_clips))
+    indexes = {asset_id: index for index, asset_id in enumerate(inputs)}
+    fps = f"{sequence.fps_num}/{sequence.fps_den}"
+
+    def filter_seconds(frames: int) -> str:
+        micros = sequence.frame_time(frames) * 1_000_000
+        rounded = (2 * micros.numerator + micros.denominator) // (2 * micros.denominator)
+        whole, fractional = divmod(rounded, 1_000_000)
+        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
+
+    def sample_index(frames: int) -> int:
+        samples = sequence.frame_time(frames) * 48000
+        return (2 * samples.numerator + samples.denominator) // (2 * samples.denominator)
+
+    graph = [
+        f"color=c=black:s={sequence.width}x{sequence.height}:r={fps},"
+        f"trim=end_frame={duration_frames},setpts=PTS-STARTPTS,format=yuv420p[vbase0]"
+    ]
+    base = "vbase0"
+    node = 1
+    video_tracks = [track for track in sequence.tracks if track.kind == "video"]
+    for track_index, track in enumerate(video_tracks):
+        for clip_index, clip in enumerate(sorted(track.clips, key=lambda item: (item.start_frame, item.id))):
+            label = f"vclip{track_index}_{clip_index}"
+            start_time = filter_seconds(clip.start_frame)
+            pip = _effect(clip, "pip")
+            out_width = pip.parameters["width"] if pip else sequence.width
+            out_height = pip.parameters["height"] if pip else sequence.height
+            graph.append(
+                f"[{indexes[clip.asset_id]}:v]trim=start_frame={clip.source_in_frame}:"
+                f"end_frame={clip.source_in_frame + clip.duration_frames},setpts=PTS-STARTPTS+"
+                f"{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
+                f"scale={out_width}:{out_height},setsar=1,fps={fps},"
+                f"format=yuva420p[{label}]"
+            )
+            fade = _effect(clip, "crossfade")
+            if fade is not None:
+                seconds = filter_seconds(fade.parameters["duration_frames"])
+                faded = label + "fade"
+                graph.append(f"[{label}]fade=t=in:st={start_time}:d={seconds}:alpha=1[{faded}]")
+                label = faded
+            if pip is None:
+                x, y = 0, 0
+            else:
+                x, y = pip.parameters["x"], pip.parameters["y"]
+            out = f"vbase{node}"
+            graph.append(f"[{base}][{label}]overlay=x={x}:y={y}:eof_action=pass:shortest=0:format=auto[{out}]")
+            base = out
+            node += 1
+    if base != "vout":
+        graph.append(f"[{base}]null[vout]")
+
+    audio_labels = []
+    audio_index = 0
+    for track in sequence.tracks:
+        if track.kind != "audio":
+            continue
+        for clip in sorted(track.clips, key=lambda item: (item.start_frame, item.id)):
+            label = f"aclip{audio_index}"
+            start_sample = sample_index(clip.source_in_frame)
+            end_sample = sample_index(clip.source_in_frame + clip.duration_frames)
+            delay = sample_index(clip.start_frame)
+            volume = _effect(clip, "volume")
+            gain = _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0) if volume else 1.0
+            graph.append(
+                f"[{indexes[clip.asset_id]}:a]aresample=48000,atrim=start_sample={start_sample}:"
+                f"end_sample={end_sample},asetpts=N/SR/TB,volume={gain:g},adelay={delay}S|{delay}S,"
+                f"apad,atrim=end_sample={sample_index(duration_frames)},"
+                f"asetpts=N/SR/TB[{label}]"
+            )
+            audio_labels.append(label)
+            audio_index += 1
+    if audio_labels:
+        graph.append("".join(f"[{label}]" for label in audio_labels) +
+                     f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
+                     f"atrim=end_sample={sample_index(duration_frames)},"
+                     "asetpts=N/SR/TB[aout]")
+    else:
+        graph.append(f"anullsrc=r=48000:cl=stereo,atrim=end_sample={sample_index(duration_frames)}[aout]")
+    return {
+        "inputs": inputs, "filtergraph": ";".join(graph),
+        "duration_frames": duration_frames, "fps": fps,
+        "width": sequence.width, "height": sequence.height,
+    }
+
+
 def compile_timeline(project: Project) -> dict[str, Any]:
     """Compile the explicitly supported two-video/two-audio demo topology."""
     project.validate()
+    if len(project.sequences) == 1:
+        tracks = project.sequences[0].tracks
+        if len(tracks) != 4 or [track.kind for track in tracks] != ["video", "video", "audio", "audio"] or [len(track.clips) for track in tracks] != [2, 1, 1, 1]:
+            return _compile_extensible_timeline(project)
     if len(project.sequences) != 1:
         raise ValueError("exactly one sequence is supported")
     sequence = project.sequences[0]

@@ -12,7 +12,9 @@ from pathlib import Path
 
 from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.project import Project
-from cloud_video_studio.timeline_edits import move_clip, trim_clip
+from cloud_video_studio.timeline_edits import (
+    add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
+)
 from cloud_video_studio.media import compile_timeline, make_demo_project, render_project
 
 p = argparse.ArgumentParser()
@@ -236,12 +238,27 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('request must be an object')
                 operation = data.get('operation')
                 if operation == 'move':
-                    if set(data) != {'project', 'operation', 'clip_id', 'start_frame'}:
+                    allowed = {'project', 'operation', 'clip_id', 'start_frame', 'track_id', 'snap_frames'}
+                    if not {'project', 'operation', 'clip_id', 'start_frame'} <= set(data) or set(data) - allowed:
                         raise ValueError('invalid move fields')
                     if not isinstance(data['clip_id'], str):
                         raise ValueError('clip_id must be a string')
                     project = decode_project(data['project'])
-                    edited = move_clip(project, data['clip_id'], data['start_frame'])
+                    if 'track_id' in data or 'snap_frames' in data:
+                        track_id = data.get('track_id')
+                        if track_id is None:
+                            track_id = next(
+                                track.id for sequence in project.sequences for track in sequence.tracks
+                                if any(clip.id == data['clip_id'] for clip in track.clips)
+                            )
+                        if not isinstance(track_id, str):
+                            raise ValueError('track_id must be a string when supplied')
+                        edited = move_clip_to_track(
+                            project, data['clip_id'], data['start_frame'], track_id,
+                            snap_frames=data.get('snap_frames', 0),
+                        )
+                    else:
+                        edited = move_clip(project, data['clip_id'], data['start_frame'])
                 elif operation == 'trim':
                     if set(data) != {'project', 'operation', 'clip_id', 'source_in_frame', 'duration_frames'}:
                         raise ValueError('invalid trim fields')
@@ -249,10 +266,57 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('clip_id must be a string')
                     project = decode_project(data['project'])
                     edited = trim_clip(project, data['clip_id'], data['source_in_frame'], data['duration_frames'])
+                elif operation == 'split':
+                    if set(data) not in (
+                        {'project', 'operation', 'clip_id', 'at_frame'},
+                        {'project', 'operation', 'clip_id', 'at_frame', 'new_clip_id'},
+                    ) or not isinstance(data.get('clip_id'), str):
+                        raise ValueError('invalid split fields')
+                    project = decode_project(data['project'])
+                    edited = split_clip(project, data['clip_id'], data['at_frame'], data.get('new_clip_id'))
+                elif operation == 'delete':
+                    if (set(data) != {'project', 'operation', 'clip_id', 'p2_version'}
+                            or type(data.get('p2_version')) is not int or data['p2_version'] != 2
+                            or not isinstance(data.get('clip_id'), str)):
+                        raise ValueError('invalid delete fields')
+                    project = decode_project(data['project'])
+                    edited = delete_clip(project, data['clip_id'])
+                elif operation == 'add':
+                    if set(data) != {'project', 'operation', 'asset_id', 'track_id', 'start_frame', 'clip_id'}:
+                        raise ValueError('invalid add fields')
+                    if not all(isinstance(data[name], str) for name in ('asset_id', 'track_id', 'clip_id')):
+                        raise ValueError('asset_id, track_id and clip_id must be strings')
+                    project = decode_project(data['project'])
+                    edited = add_clip(
+                        project, data['asset_id'], data['track_id'], data['start_frame'], data['clip_id'],
+                    )
+                elif operation == 'add_track':
+                    if set(data) != {'project', 'operation', 'kind', 'track_id'}:
+                        raise ValueError('invalid add_track fields')
+                    if not isinstance(data['kind'], str) or not isinstance(data['track_id'], str):
+                        raise ValueError('kind and track_id must be strings')
+                    project = decode_project(data['project'])
+                    edited = add_track(project, data['kind'], data['track_id'])
+                elif operation == 'reorder':
+                    if set(data) not in (
+                        {'project', 'operation', 'clip_id'},
+                        {'project', 'operation', 'clip_id', 'before_clip_id'},
+                    ) or not isinstance(data.get('clip_id'), str):
+                        raise ValueError('invalid reorder fields')
+                    project = decode_project(data['project'])
+                    before = data.get('before_clip_id')
+                    if before is not None and not isinstance(before, str):
+                        raise ValueError('before_clip_id must be a string')
+                    edited = reorder_clip(project, data['clip_id'], before)
                 else:
                     raise ValueError('unknown operation')
                 compile_timeline(edited)
-                return self.reply(200, {'status': 'edited', 'project': edited.to_dict()})
+                response = {'status': 'edited', 'project': edited.to_dict()}
+                if operation == 'add':
+                    response['clip_id'] = data['clip_id']
+                if operation == 'add_track':
+                    response['track_id'] = data['track_id']
+                return self.reply(200, response)
             if self.path not in {'/project', '/render'}:
                 return self.reply(404, {'error': 'NOT_FOUND'})
             project = decode_project(data)

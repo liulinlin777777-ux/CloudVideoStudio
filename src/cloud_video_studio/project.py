@@ -107,6 +107,19 @@ class Project:
             _positive_int(sequence.fps_num, "sequence fps_num")
             _positive_int(sequence.fps_den, "sequence fps_den")
             _require_list(sequence.tracks, "sequence tracks")
+            if len(sequence.tracks) > 8:
+                raise ValueError("a sequence may contain at most eight tracks")
+            if any(not isinstance(track, Track) for track in sequence.tracks):
+                raise ValueError("tracks must contain Track objects")
+            for track in sequence.tracks:
+                _require_list(track.clips, "track clips")
+            video_tracks = sum(track.kind == "video" for track in sequence.tracks)
+            audio_tracks = sum(track.kind == "audio" for track in sequence.tracks)
+            if video_tracks > 4 or audio_tracks > 4:
+                raise ValueError("a sequence may contain at most four video and four audio tracks")
+            clip_count = sum(len(track.clips) for track in sequence.tracks)
+            if clip_count > 20:
+                raise ValueError("a sequence may contain at most twenty media clips")
             for track in sequence.tracks:
                 if not isinstance(track, Track):
                     raise ValueError("tracks must contain Track objects")
