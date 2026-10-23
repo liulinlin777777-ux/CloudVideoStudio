@@ -27,6 +27,8 @@ jobs:
           python -m unittest discover -s tests -v
           python -m compileall -q src tools
           python -m pip wheel --no-deps . --wheel-dir build/wheels
+      - name: Real loopback edit/save/reload HTTP acceptance
+        run: python tools/preview_http_smoke.py
       - name: Real multi-track render and plugin acceptance
         run: python tools/media_smoke.py --output-dir build/media
       - name: P1 slice 2 independent real-media acceptance
