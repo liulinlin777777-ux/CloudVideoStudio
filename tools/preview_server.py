@@ -2,12 +2,15 @@
 import argparse
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
+from urllib.parse import unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.project import Project
 from cloud_video_studio.timeline_edits import move_clip, trim_clip
 from cloud_video_studio.media import compile_timeline, make_demo_project, render_project
@@ -20,7 +23,11 @@ a = p.parse_args()
 root = Path(a.media_root).resolve()
 html = Path(__file__).resolve().parents[1] / 'web/index.html'
 lock = threading.Lock()
+asset_lock = threading.RLock()
 MAX_BODY = 65536
+MAX_UPLOAD = 512 * 1024 * 1024
+upload_slots = threading.BoundedSemaphore(2)
+asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024)
 
 
 def saved_path():
@@ -60,6 +67,40 @@ class Handler(BaseHTTPRequestHandler):
             None, f'http://127.0.0.1:{a.port}', f'http://localhost:{a.port}'
         }
 
+    def browser_origin(self):
+        return self.headers.get('Origin') in {f'http://127.0.0.1:{a.port}', f'http://localhost:{a.port}'}
+
+    def read_upload(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except (TypeError, ValueError):
+            raise ValueError('invalid content length')
+        if not 0 < length <= MAX_UPLOAD:
+            raise OverflowError('upload size')
+        raw_name = unquote(self.headers.get('X-File-Name', ''))
+        # Only a filename is accepted. Never interpret a browser supplied path.
+        if not raw_name or raw_name in {'.', '..'} or '/' in raw_name or '\\' in raw_name or Path(raw_name).name != raw_name:
+            raise ValueError('invalid upload filename')
+        if any(ord(char) < 32 or ord(char) == 127 for char in raw_name):
+            raise ValueError('invalid upload filename')
+        suffix = Path(raw_name).suffix.lower()
+        fd, temporary = tempfile.mkstemp(prefix='.asset-upload-', suffix=suffix, dir=root)
+        count = 0
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError('incomplete upload body')
+                    stream.write(chunk)
+                    count += len(chunk)
+                    remaining -= len(chunk)
+            return Path(temporary), raw_name
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
     def media(self, name):
         allowed = name == 'render.mp4' or (
             name.startswith('preview-') and name.endswith('.mp4') and len(name) == 44
@@ -87,6 +128,25 @@ class Handler(BaseHTTPRequestHandler):
                 project = current()
                 compile_timeline(project)
                 return self.reply(200, project.to_dict())
+            if self.path == '/assets':
+                with asset_lock:
+                    return self.reply(200, {'schema_version': 2, 'assets': asset_store.list_assets()})
+            if self.path.startswith('/assets/') and self.path.endswith('/thumbnail'):
+                asset_id = self.path[len('/assets/'):-len('/thumbnail')].strip('/')
+                if len(asset_id) != 32 or any(ch not in '0123456789abcdef' for ch in asset_id):
+                    return self.reply(404, {'error': 'NOT_FOUND'})
+                with asset_lock:
+                    derivative = asset_store.create_thumbnail(asset_id)
+                    path = asset_store.root / derivative['path']
+                    return self.reply(200, path.read_bytes(), 'image/jpeg')
+            if self.path.startswith('/assets/') and self.path.endswith('/proxy'):
+                asset_id = self.path[len('/assets/'):-len('/proxy')].strip('/')
+                if len(asset_id) != 32 or any(ch not in '0123456789abcdef' for ch in asset_id):
+                    return self.reply(404, {'error': 'NOT_FOUND'})
+                with asset_lock:
+                    derivative = asset_store.create_proxy(asset_id, ffmpeg=a.ffmpeg)
+                    path = asset_store.root / derivative['path']
+                    return self.reply(200, path.read_bytes(), 'video/mp4')
             if self.path.startswith('/media/') and '/' not in self.path[7:]:
                 return self.media(self.path[7:])
             return self.reply(404, {'error': 'NOT_FOUND'})
@@ -140,6 +200,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.safe():
             return self.reply(403, {'error': 'ORIGIN_DENIED'})
+        relink_match = re.fullmatch(r'/assets/([0-9a-f]{32})/relink', self.path)
+        if self.path == '/assets/import' or relink_match:
+            if not self.browser_origin():
+                return self.reply(403, {'error': 'ORIGIN_DENIED'})
+            if not upload_slots.acquire(blocking=False):
+                return self.reply(503, {'error': 'UPLOAD_BUSY'})
+            temporary = None
+            try:
+                temporary, filename = self.read_upload()
+                suffix = Path(filename).suffix.lower()
+                if suffix not in {'.mp4', '.mov', '.mp3', '.wav', '.jpg', '.jpeg', '.png', '.srt'}:
+                    return self.reply(415, {'error': 'UNSUPPORTED_FILE_TYPE'})
+                with asset_lock:
+                    asset = (asset_store.relink(relink_match.group(1), temporary, filename=filename)
+                             if relink_match else asset_store.import_file(temporary, filename=filename))
+                return self.reply(201, asset)
+            except OverflowError:
+                return self.reply(413, {'error': 'UPLOAD_SIZE'})
+            except Exception as error:
+                return self.reply(400, {'error': str(error)[:240]})
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                upload_slots.release()
         try:
             data = self.read_json()
         except OverflowError:
@@ -193,6 +277,33 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, {'error': type(error).__name__})
 
 
-server = ThreadingHTTPServer(('127.0.0.1', a.port), Handler)
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, max_handlers=8, **kwargs):
+        self.handler_slots = threading.BoundedSemaphore(max_handlers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.handler_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.handler_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.handler_slots.release()
+
+
+server = BoundedThreadingHTTPServer(('127.0.0.1', a.port), Handler)
 print(f'P0_PREVIEW=http://127.0.0.1:{a.port}', flush=True)
 server.serve_forever()

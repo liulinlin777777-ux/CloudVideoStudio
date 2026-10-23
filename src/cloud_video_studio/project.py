@@ -12,6 +12,7 @@ class Asset:
     id: str
     uri: str
     duration_frames: int
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,7 +75,7 @@ class Project:
     schema_version: int = 1
 
     def validate(self) -> None:
-        if not _is_int(self.schema_version) or self.schema_version != 1:
+        if not _is_int(self.schema_version) or self.schema_version not in (1, 2):
             raise ValueError("unsupported project schema_version")
         _require_id(self.id, "project id")
         _require_list(self.assets, "assets")
@@ -89,6 +90,10 @@ class Project:
             if not isinstance(asset.uri, str):
                 raise ValueError("asset uri must be a string")
             _positive_int(asset.duration_frames, "asset duration_frames")
+            if not isinstance(asset.metadata, dict):
+                raise ValueError("asset metadata must be an object")
+            if self.schema_version == 2 and asset.metadata.get("version") != 2:
+                raise ValueError("schema-2 assets require version-2 asset metadata")
 
         sequence_ids: set[str] = set()
         track_ids: set[str] = set()
@@ -146,7 +151,10 @@ class Project:
         return {
             "id": self.id,
             "assets": [
-                {"id": asset.id, "uri": asset.uri, "duration_frames": asset.duration_frames}
+                {
+                    **{"id": asset.id, "uri": asset.uri, "duration_frames": asset.duration_frames},
+                    **({"metadata": asset.metadata} if self.schema_version >= 2 else {}),
+                }
                 for asset in self.assets
             ],
             "sequences": [
@@ -196,7 +204,7 @@ class Project:
     def from_dict(cls, data: dict[str, Any]) -> "Project":
         _check_fields(data, {"id", "assets", "sequences", "render_jobs", "schema_version"}, "project")
         assets = [
-            Asset(**_checked(item, {"id", "uri", "duration_frames"}, "asset"))
+            Asset(**_checked(item, {"id", "uri", "duration_frames", "metadata"}, "asset"))
             for item in data.get("assets", [])
         ]
         sequences = []
@@ -232,6 +240,14 @@ class Project:
         )
         project.validate()
         return project
+
+    def upgrade_asset_metadata(self) -> None:
+        """Upgrade a schema-1 project in memory without rewriting its source file."""
+        self.validate()
+        for asset in self.assets:
+            asset.metadata = {**asset.metadata, "version": 2}
+        self.schema_version = 2
+        self.validate()
 
     def save(self, path: str | Path) -> None:
         self.validate()
