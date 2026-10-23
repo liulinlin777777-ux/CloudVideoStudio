@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 import threading
 import uuid
+import fcntl
+from contextlib import contextmanager
 from fractions import Fraction
 from functools import wraps
 from typing import Any
@@ -44,7 +46,7 @@ _STORE_LOCKS_GUARD = threading.Lock()
 def _store_transaction(method):
     @wraps(method)
     def locked(self, *args, **kwargs):
-        with self._lock:
+        with self._lock, self._process_lock():
             return method(self, *args, **kwargs)
     return locked
 
@@ -63,6 +65,7 @@ class AssetStore:
         max_total_bytes: int = _DEFAULT_TOTAL_LIMIT,
     ) -> None:
         self.root = Path(os.path.abspath(Path(root).expanduser()))
+        self._reject_symlink_ancestors(self.root)
         with _STORE_LOCKS_GUARD:
             self._lock = _STORE_LOCKS.setdefault(str(self.root), threading.RLock())
         self.max_file_bytes = self._limit(max_file_bytes, "max_file_bytes")
@@ -79,13 +82,66 @@ class AssetStore:
             raise ValueError("asset files path must be a real directory")
         self.files.mkdir(exist_ok=True)
         self.manifest = self.root / _MANIFEST
+        self.lockfile = self.root / ".assets.lock"
         with self._lock:
-            if self.manifest.is_symlink():
-                raise ValueError("asset manifest must not be a symlink")
-            if not self.manifest.exists():
-                self._write_manifest([])
-            else:
-                self._read_manifest()
+            with self._process_lock():
+                if self.manifest.is_symlink():
+                    raise ValueError("asset manifest must not be a symlink")
+                if not self.manifest.exists():
+                    self._write_manifest([])
+                else:
+                    self._read_manifest()
+
+    @staticmethod
+    def _reject_symlink_ancestors(path: Path) -> None:
+        target = Path(os.path.abspath(path))
+        trusted_anchors = (Path(tempfile.gettempdir()), Path.cwd())
+        containing = []
+        for candidate in trusted_anchors:
+            try:
+                if os.path.commonpath((str(target), str(candidate))) == str(candidate):
+                    containing.append(candidate)
+            except ValueError:
+                continue
+        if containing:
+            anchor = max(containing, key=lambda item: len(item.parts))
+        else:
+            anchor = target
+            while not anchor.exists() and anchor.parent != anchor:
+                anchor = anchor.parent
+            if anchor.is_file():
+                anchor = anchor.parent
+        try:
+            relative_parts = target.relative_to(anchor).parts
+        except ValueError as exc:
+            raise ValueError("path is outside the trusted runtime anchor") from exc
+        current = anchor
+        for component in (".", *relative_parts):
+            if component != ".":
+                current /= component
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ValueError("path descendant is unavailable") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError("symlink path ancestors are not accepted")
+
+    @contextmanager
+    def _process_lock(self):
+        if self.lockfile.is_symlink():
+            raise ValueError("asset lock must not be a symlink")
+        descriptor = os.open(self.lockfile, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            lock_info = os.fstat(descriptor)
+            if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1:
+                raise ValueError("asset lock must be a regular, unaliased file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     @staticmethod
     def _limit(value: int, name: str) -> int:
@@ -115,7 +171,10 @@ class AssetStore:
         assets = self._read_manifest()
         if sum(item["size_bytes"] for item in assets) + size > self.max_total_bytes:
             raise ValueError("asset store total size limit exceeded")
-        self._copy_checked(source, target, size)
+        digest = self._copy_checked(source, target, size)
+        metadata = self._inspect(target, kind)
+        record["sha256"] = digest
+        record["metadata"] = metadata
         assets.append(record)
         try:
             self._write_manifest(assets)
@@ -282,7 +341,7 @@ class AssetStore:
         new_total = sum(item["size_bytes"] for item in assets) - old["size_bytes"] + size
         if size > self.max_file_bytes or new_total > self.max_total_bytes:
             raise ValueError("asset store size limit exceeded")
-        target_name = f"{asset_id}{suffix}"
+        target_name = f"{asset_id}-{uuid.uuid4().hex}{suffix}"
         target = self.files / target_name
         if target.is_symlink():
             raise ValueError("managed asset path must not be a symlink")
@@ -298,11 +357,11 @@ class AssetStore:
             record["filename"] = filename
         # Keep the prior managed file until the new manifest is committed.
         temporary = self._temporary_path()
-        backup = self._temporary_path() if old_path.exists() else None
         try:
-            self._copy_checked(source, temporary, size)
-            if backup is not None:
-                os.replace(old_path, backup)
+            digest = self._copy_checked(source, temporary, size)
+            metadata = self._inspect(temporary, kind)
+            record["sha256"] = digest
+            record["metadata"] = metadata
             os.replace(temporary, target)
             temporary = None
             assets[index] = record
@@ -310,21 +369,14 @@ class AssetStore:
                 self._write_manifest(assets)
             except BaseException:
                 target.unlink(missing_ok=True)
-                if backup is not None:
-                    os.replace(backup, old_path)
-                    backup = None
                 raise
-            if backup is not None:
-                backup.unlink(missing_ok=True)
-                backup = None
+            try:
+                old_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-            if backup is not None:
-                if not old_path.exists():
-                    os.replace(backup, old_path)
-                else:
-                    backup.unlink(missing_ok=True)
         return dict(record)
 
     def _source(self, path: str | Path) -> tuple[Path, int]:
@@ -335,6 +387,7 @@ class AssetStore:
             raise ValueError("source file is unavailable") from exc
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise ValueError("source must be a regular file, not a symlink")
+        self._reject_symlink_ancestors(source.parent)
         if info.st_nlink != 1:
             raise ValueError("hard-linked source files are not accepted")
         if info.st_size <= 0 or info.st_size > self.max_file_bytes:
@@ -404,7 +457,11 @@ class AssetStore:
             allowed = {".mp3": {"mp3"}, ".wav": {"pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le", "pcm_u8"}}
             if audio.get("codec_name") not in allowed[suffix]:
                 raise ValueError(f"unsupported audio codec for {suffix}")
-            result = {"codec": audio["codec_name"]}
+            result = {
+                "codec": audio["codec_name"],
+                "sample_rate": _positive_probe_int(audio.get("sample_rate"), "sample rate"),
+                "channels": _positive_probe_int(audio.get("channels"), "channel count"),
+            }
         else:
             image = selected[0]
             codec = image.get("codec_name")
@@ -418,6 +475,28 @@ class AssetStore:
         if duration is not None:
             result["duration_seconds"] = duration
         result["format"] = probe.get("format", {}).get("format_name")
+        result["streams"] = [
+            {
+                key: value for key, value in {
+                    "index": _stream_index(stream.get("index")),
+                    "type": stream.get("codec_type"),
+                    "codec": stream.get("codec_name"),
+                    "profile": stream.get("profile"),
+                    "width": stream.get("width"),
+                    "height": stream.get("height"),
+                    "duration_seconds": _duration(probe, stream),
+                    "fps": _json_frame_rate(
+                        _frame_rate(stream.get("avg_frame_rate"))
+                        or _frame_rate(stream.get("r_frame_rate"))
+                    ),
+                    "sample_rate": _positive_probe_int(stream.get("sample_rate"), "sample rate")
+                    if stream.get("codec_type") == "audio" else None,
+                    "channels": _positive_probe_int(stream.get("channels"), "channel count")
+                    if stream.get("codec_type") == "audio" else None,
+                }.items() if value is not None
+            }
+            for stream in streams if isinstance(stream, dict)
+        ]
         return result
 
     def _read_manifest(self) -> list[dict[str, Any]]:
@@ -497,7 +576,7 @@ class AssetStore:
         path.unlink()
         return path
 
-    def _copy_checked(self, source: Path, target: Path, expected_size: int) -> None:
+    def _copy_checked(self, source: Path, target: Path, expected_size: int) -> str:
         if target.exists() or target.is_symlink():
             raise ValueError("asset destination already exists")
         digest = hashlib.sha256()
@@ -532,9 +611,11 @@ class AssetStore:
         if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or current.st_size != expected_size:
             target.unlink(missing_ok=True)
             raise ValueError("source changed while it was being imported")
-        if digest.hexdigest() != _hash_file(source):
+        copied_hash = digest.hexdigest()
+        if copied_hash != _hash_file(source):
             target.unlink(missing_ok=True)
             raise ValueError("source changed while it was being imported")
+        return copied_hash
 
 
 def _hash_file(path: Path) -> str:
@@ -581,7 +662,7 @@ def _ffprobe(path: Path) -> dict[str, Any]:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "format=format_name,duration:stream=codec_type,codec_name,profile,width,height,duration,avg_frame_rate,r_frame_rate",
+             "format=format_name,duration:stream=index,codec_type,codec_name,profile,width,height,duration,avg_frame_rate,r_frame_rate,sample_rate,channels",
              "-show_format", "-show_streams", "-of", "json", str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=_PROBE_TIMEOUT_SECONDS, check=False,
@@ -607,6 +688,22 @@ def _positive_probe_int(value: Any, name: str) -> int:
     if number <= 0:
         raise ValueError(f"FFprobe returned invalid {name}")
     return number
+
+
+def _stream_index(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("FFprobe returned an invalid stream index")
+    try:
+        index = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("FFprobe returned an invalid stream index") from exc
+    if index < 0 or str(index) != str(value).strip():
+        raise ValueError("FFprobe returned an invalid stream index")
+    return index
+
+
+def _json_frame_rate(value: tuple[int, int] | None) -> list[int] | None:
+    return list(value) if value is not None else None
 
 
 def _dimensions(width_value: Any, height_value: Any, name: str) -> tuple[int, int]:

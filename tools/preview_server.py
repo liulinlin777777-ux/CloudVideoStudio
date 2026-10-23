@@ -26,6 +26,7 @@ lock = threading.Lock()
 asset_lock = threading.RLock()
 MAX_BODY = 65536
 MAX_UPLOAD = 512 * 1024 * 1024
+upload_slots = threading.BoundedSemaphore(2)
 asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024)
 
 
@@ -203,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/assets/import' or relink_match:
             if not self.browser_origin():
                 return self.reply(403, {'error': 'ORIGIN_DENIED'})
+            if not upload_slots.acquire(blocking=False):
+                return self.reply(503, {'error': 'UPLOAD_BUSY'})
             temporary = None
             try:
                 temporary, filename = self.read_upload()
@@ -220,6 +223,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
+                upload_slots.release()
         try:
             data = self.read_json()
         except OverflowError:
@@ -273,6 +277,33 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, {'error': type(error).__name__})
 
 
-server = ThreadingHTTPServer(('127.0.0.1', a.port), Handler)
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, max_handlers=8, **kwargs):
+        self.handler_slots = threading.BoundedSemaphore(max_handlers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.handler_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.handler_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.handler_slots.release()
+
+
+server = BoundedThreadingHTTPServer(('127.0.0.1', a.port), Handler)
 print(f'P0_PREVIEW=http://127.0.0.1:{a.port}', flush=True)
 server.serve_forever()
