@@ -35,7 +35,7 @@ jobs:
         run: python tools/p1_media_smoke.py --output-dir build/p1-media
       - name: OTIO and MLT candidate verification
         run: python tools/candidate_smoke.py --output-dir build/candidates
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: p0-public-synthetic-evidence
