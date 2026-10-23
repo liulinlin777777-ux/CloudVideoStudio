@@ -14,14 +14,18 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import uuid
+from fractions import Fraction
+from functools import wraps
 from typing import Any
 
 
 _MANIFEST = "assets.json"
-_MANIFEST_VERSION = 1
+_MANIFEST_VERSION = 2
 _DEFAULT_FILE_LIMIT = 2 * 1024 * 1024 * 1024
 _DEFAULT_TOTAL_LIMIT = 10 * 1024 * 1024 * 1024
+_DERIVATIVE_TOTAL_LIMIT = 512 * 1024 * 1024
 _PROBE_TIMEOUT_SECONDS = 15
 _SUPPORTED = {
     ".mp4": "video", ".mov": "video",
@@ -33,6 +37,16 @@ _SRT_TIME = re.compile(
     r"^(\d{2,}):([0-5]\d):([0-5]\d),(\d{3}) --> "
     r"(\d{2,}):([0-5]\d):([0-5]\d),(\d{3})(?: .*)?$"
 )
+_STORE_LOCKS: dict[str, threading.RLock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _store_transaction(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class AssetStore:
@@ -48,7 +62,9 @@ class AssetStore:
         max_file_bytes: int = _DEFAULT_FILE_LIMIT,
         max_total_bytes: int = _DEFAULT_TOTAL_LIMIT,
     ) -> None:
-        self.root = Path(root).expanduser().absolute()
+        self.root = Path(os.path.abspath(Path(root).expanduser()))
+        with _STORE_LOCKS_GUARD:
+            self._lock = _STORE_LOCKS.setdefault(str(self.root), threading.RLock())
         self.max_file_bytes = self._limit(max_file_bytes, "max_file_bytes")
         self.max_total_bytes = self._limit(max_total_bytes, "max_total_bytes")
         if self.max_file_bytes > self.max_total_bytes:
@@ -63,12 +79,13 @@ class AssetStore:
             raise ValueError("asset files path must be a real directory")
         self.files.mkdir(exist_ok=True)
         self.manifest = self.root / _MANIFEST
-        if self.manifest.is_symlink():
-            raise ValueError("asset manifest must not be a symlink")
-        if not self.manifest.exists():
-            self._write_manifest([])
-        else:
-            self._read_manifest()
+        with self._lock:
+            if self.manifest.is_symlink():
+                raise ValueError("asset manifest must not be a symlink")
+            if not self.manifest.exists():
+                self._write_manifest([])
+            else:
+                self._read_manifest()
 
     @staticmethod
     def _limit(value: int, name: str) -> int:
@@ -76,7 +93,8 @@ class AssetStore:
             raise ValueError(f"{name} must be a positive integer")
         return value
 
-    def import_file(self, path: str | Path) -> dict[str, Any]:
+    @_store_transaction
+    def import_file(self, path: str | Path, *, filename: str | None = None) -> dict[str, Any]:
         """Validate, copy, and register a source file, returning its record."""
         source, size = self._source(path)
         suffix = source.suffix.lower()
@@ -88,6 +106,12 @@ class AssetStore:
         name = f"{asset_id}{suffix}"
         target = self.files / name
         record = self._record(source, target, asset_id, kind, size, metadata)
+        if filename is not None:
+            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+                    or filename in {'.', '..'} or '/' in filename or '\\' in filename
+                    or any(ord(char) < 32 or ord(char) == 127 for char in filename)):
+                raise ValueError("invalid display filename")
+            record["filename"] = filename
         assets = self._read_manifest()
         if sum(item["size_bytes"] for item in assets) + size > self.max_total_bytes:
             raise ValueError("asset store total size limit exceeded")
@@ -100,11 +124,149 @@ class AssetStore:
             raise
         return dict(record)
 
+    @_store_transaction
     def list_assets(self) -> list[dict[str, Any]]:
         """Return persisted records in stable insertion order."""
         return [dict(item) for item in self._read_manifest()]
 
-    def relink(self, asset_id: str, path: str | Path) -> dict[str, Any]:
+    @_store_transaction
+    def create_thumbnail(self, asset_id: str, *, ffmpeg: str = "ffmpeg", timeout: float = 20) -> dict[str, Any]:
+        """Create a small JPEG derivative for a validated video or still image."""
+        record = self._asset(asset_id)
+        if record["kind"] not in {"video", "image"}:
+            raise ValueError("thumbnails require a video or image asset")
+        source = self._managed_path(record)
+        self._verify_managed(source, record)
+        target = self._derivative_path(asset_id, "thumbnail.jpg")
+        output_limit = self._derivative_limit(target, 5 * 1024 * 1024)
+        try:
+            self._run_ffmpeg([
+                ffmpeg, "-nostdin", "-y", "-v", "error", "-i", str(source), "-frames:v", "1",
+                "-vf", "scale=640:360:force_original_aspect_ratio=decrease", "-threads", "1", "-fs", str(output_limit), str(target),
+            ], timeout, "thumbnail generation")
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        result = self._check_derivative(target, "image/jpeg", output_limit)
+        self._check_derivative_total()
+        return result
+
+    @_store_transaction
+    def create_proxy(self, asset_id: str, *, ffmpeg: str = "ffmpeg", timeout: float = 120) -> dict[str, Any]:
+        """Create a bounded 640x360 H.264/AAC derivative for a validated video."""
+        record = self._asset(asset_id)
+        if record["kind"] != "video":
+            raise ValueError("proxies require a video asset")
+        source = self._managed_path(record)
+        self._verify_managed(source, record)
+        target = self._derivative_path(asset_id, "proxy.mp4")
+        output_limit = self._derivative_limit(target, 256 * 1024 * 1024)
+        try:
+            self._run_ffmpeg([
+                ffmpeg, "-nostdin", "-y", "-v", "error", "-i", str(source),
+                "-vf", "scale=640:360:force_original_aspect_ratio=decrease", "-t", "600",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-c:a", "aac", "-threads", "2",
+                "-fs", str(output_limit), str(target),
+            ], timeout, "proxy generation")
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        result = self._check_derivative(target, "video/mp4", output_limit)
+        try:
+            probe = _ffprobe(target)
+        except ValueError:
+            target.unlink(missing_ok=True)
+            raise
+        streams = probe.get("streams", [])
+        video = next((s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"), None)
+        if video is None or video.get("codec_name") != "h264":
+            target.unlink(missing_ok=True)
+            raise ValueError("proxy output metadata is invalid")
+        width, height = _dimensions(video.get("width"), video.get("height"), "proxy")
+        result["metadata"] = {"codec": "h264", "width": width, "height": height}
+        self._check_derivative_total()
+        return result
+
+    def _asset(self, asset_id: str) -> dict[str, Any]:
+        for record in self._read_manifest():
+            if record["id"] == asset_id:
+                return record
+        raise ValueError("unknown asset id")
+
+    def _verify_managed(self, path: Path, record: dict[str, Any]) -> None:
+        if not path.is_file() or path.stat().st_size != record["size_bytes"] or _hash_file(path) != record["sha256"]:
+            raise ValueError("managed asset is missing or failed its content hash")
+        if self._inspect(path, record["kind"]) != record["metadata"]:
+            raise ValueError("managed asset metadata no longer matches its validated probe")
+
+    def _derivative_path(self, asset_id: str, suffix: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise ValueError("invalid asset id")
+        directory = self.root / "derivatives"
+        if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+            raise ValueError("derivative directory must be a real directory")
+        directory.mkdir(exist_ok=True)
+        target = directory / f"{asset_id}-{suffix}"
+        if target.is_symlink():
+            raise ValueError("derivative target must not be a symlink")
+        target.unlink(missing_ok=True)
+        return target
+
+    def _derivative_limit(self, target: Path, per_file_limit: int) -> int:
+        used = sum(path.stat().st_size for path in (self.root / "derivatives").iterdir()
+                   if path.is_file() and not path.is_symlink() and path != target)
+        available = _DERIVATIVE_TOTAL_LIMIT - used
+        if available <= 0:
+            raise ValueError("asset derivative storage limit exceeded")
+        return min(per_file_limit, available)
+
+    def _check_derivative_total(self) -> None:
+        used = sum(path.stat().st_size for path in (self.root / "derivatives").iterdir()
+                   if path.is_file() and not path.is_symlink())
+        if used > _DERIVATIVE_TOTAL_LIMIT:
+            raise ValueError("asset derivative storage limit exceeded")
+
+    @staticmethod
+    def _run_ffmpeg(command: list[str], timeout: float, operation: str) -> None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
+            raise ValueError("derivative timeout must be greater than 0 and at most 120 seconds")
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"{operation} failed or timed out") from exc
+        if result.returncode:
+            raise ValueError(f"{operation} failed")
+
+    @staticmethod
+    def _check_derivative(path: Path, content_type: str, maximum: int) -> dict[str, Any]:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise ValueError("derivative output was not created") from exc
+        if path.is_symlink() or not path.is_file() or size <= 0 or size > maximum:
+            path.unlink(missing_ok=True)
+            raise ValueError("derivative output is empty or exceeds its size limit")
+        if content_type == "image/jpeg":
+            with path.open("rb") as image:
+                valid = image.read(3) == b"\xff\xd8\xff"
+        else:
+            try:
+                probe = _ffprobe(path)
+            except ValueError:
+                path.unlink(missing_ok=True)
+                raise
+            streams = probe.get("streams", [])
+            valid = any(isinstance(s, dict) and s.get("codec_type") == "video" and s.get("codec_name") == "h264" for s in streams)
+            formats = probe.get("format", {}).get("format_name", "")
+            valid = valid and isinstance(formats, str) and "mp4" in formats.split(",")
+        if not valid:
+            path.unlink(missing_ok=True)
+            raise ValueError("derivative output failed format validation")
+        return {"path": path.relative_to(path.parents[1]).as_posix(), "size_bytes": size, "content_type": content_type}
+
+    @_store_transaction
+    def relink(self, asset_id: str, path: str | Path, *, filename: str | None = None) -> dict[str, Any]:
         """Replace a missing/broken asset's managed bytes while keeping its ID."""
         assets = self._read_manifest()
         index = next((i for i, item in enumerate(assets) if item["id"] == asset_id), None)
@@ -124,25 +286,45 @@ class AssetStore:
         target = self.files / target_name
         if target.is_symlink():
             raise ValueError("managed asset path must not be a symlink")
+        old_path = self._managed_path(old)
+        if target != old_path and target.exists():
+            raise ValueError("relink destination already exists")
         record = self._record(source, target, asset_id, kind, size, metadata)
-        # Stage first so a failed copy leaves the existing asset untouched.
+        if filename is not None:
+            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+                    or filename in {'.', '..'} or '/' in filename or '\\' in filename
+                    or any(ord(char) < 32 or ord(char) == 127 for char in filename)):
+                raise ValueError("invalid display filename")
+            record["filename"] = filename
+        # Keep the prior managed file until the new manifest is committed.
         temporary = self._temporary_path()
+        backup = self._temporary_path() if old_path.exists() else None
         try:
             self._copy_checked(source, temporary, size)
-            old_path = self._managed_path(old)
-            if old_path != target:
-                os.replace(temporary, target)
-                temporary = None
-                if old_path.exists():
-                    old_path.unlink()
-            else:
-                os.replace(temporary, target)
-                temporary = None
+            if backup is not None:
+                os.replace(old_path, backup)
+            os.replace(temporary, target)
+            temporary = None
             assets[index] = record
-            self._write_manifest(assets)
+            try:
+                self._write_manifest(assets)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                if backup is not None:
+                    os.replace(backup, old_path)
+                    backup = None
+                raise
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+                backup = None
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+            if backup is not None:
+                if not old_path.exists():
+                    os.replace(backup, old_path)
+                else:
+                    backup.unlink(missing_ok=True)
         return dict(record)
 
     def _source(self, path: str | Path) -> tuple[Path, int]:
@@ -182,6 +364,7 @@ class AssetStore:
             "kind": kind,
             "size_bytes": size,
             "metadata": metadata,
+            "metadata_version": 1,
         }
 
     def _inspect(self, source: Path, kind: str) -> dict[str, Any]:
@@ -211,8 +394,11 @@ class AssetStore:
                 raise ValueError("unsupported H.264 profile")
             if probe.get("format", {}).get("format_name", "").split(",")[0] not in {"mov", "mp4"}:
                 raise ValueError("video container must be MP4 or MOV")
-            width, height = _positive_probe_int(video.get("width"), "video width"), _positive_probe_int(video.get("height"), "video height")
+            width, height = _dimensions(video.get("width"), video.get("height"), "video")
             result: dict[str, Any] = {"codec": "h264", "profile": video["profile"], "width": width, "height": height}
+            frame_rate = _frame_rate(video.get("avg_frame_rate")) or _frame_rate(video.get("r_frame_rate"))
+            if frame_rate is not None:
+                result["fps_num"], result["fps_den"] = frame_rate
         elif kind == "audio":
             audio = selected[0]
             allowed = {".mp3": {"mp3"}, ".wav": {"pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le", "pcm_u8"}}
@@ -226,7 +412,8 @@ class AssetStore:
                 raise ValueError("file extension does not match PNG media")
             if suffix in {".jpg", ".jpeg"} and codec not in {"mjpeg", "jpeg2000"}:
                 raise ValueError("file extension does not match JPEG media")
-            result = {"codec": codec, "width": _positive_probe_int(image.get("width"), "image width"), "height": _positive_probe_int(image.get("height"), "image height")}
+            width, height = _dimensions(image.get("width"), image.get("height"), "image")
+            result = {"codec": codec, "width": width, "height": height}
         duration = _duration(probe, selected[0])
         if duration is not None:
             result["duration_seconds"] = duration
@@ -240,19 +427,31 @@ class AssetStore:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("asset manifest is invalid") from exc
-        if not isinstance(data, dict) or data.get("version") != _MANIFEST_VERSION or not isinstance(data.get("assets"), list):
+        if not isinstance(data, dict) or data.get("version") not in (1, _MANIFEST_VERSION) or not isinstance(data.get("assets"), list):
             raise ValueError("unsupported asset manifest")
         seen: set[str] = set()
         total_bytes = 0
         for item in data["assets"]:
-            if not isinstance(item, dict) or set(item) != {"id", "filename", "path", "sha256", "kind", "size_bytes", "metadata"}:
+            if not isinstance(item, dict) or set(item) not in (
+                {"id", "filename", "path", "sha256", "kind", "size_bytes", "metadata"},
+                {"id", "filename", "path", "sha256", "kind", "size_bytes", "metadata", "metadata_version"},
+            ):
                 raise ValueError("invalid asset manifest record")
-            if not isinstance(item["id"], str) or item["id"] in seen:
+            if not isinstance(item["id"], str) or not re.fullmatch(r"[0-9a-f]{32}", item["id"]) or item["id"] in seen:
                 raise ValueError("invalid or duplicate asset id")
             seen.add(item["id"])
-            if item["kind"] not in set(_SUPPORTED.values()) or not isinstance(item["metadata"], dict):
+            if not isinstance(item["kind"], str) or item["kind"] not in set(_SUPPORTED.values()) or not isinstance(item["metadata"], dict):
                 raise ValueError("invalid asset metadata")
-            if not isinstance(item["size_bytes"], int) or item["size_bytes"] <= 0:
+            filename = item["filename"]
+            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+                    or '/' in filename or '\\' in filename or filename in {'.', '..'}):
+                raise ValueError("invalid asset filename")
+            if not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+                raise ValueError("invalid asset content digest")
+            item.setdefault("metadata_version", 1)
+            if isinstance(item["metadata_version"], bool) or item["metadata_version"] != 1:
+                raise ValueError("unsupported asset metadata version")
+            if isinstance(item["size_bytes"], bool) or not isinstance(item["size_bytes"], int) or item["size_bytes"] <= 0:
                 raise ValueError("invalid asset size")
             if item["size_bytes"] > self.max_file_bytes:
                 raise ValueError("stored asset exceeds the configured file limit")
@@ -381,7 +580,9 @@ def _validate_srt(path: Path, max_bytes: int) -> dict[str, Any]:
 def _ffprobe(path: Path) -> dict[str, Any]:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=format_name,duration:stream=codec_type,codec_name,profile,width,height,duration,avg_frame_rate,r_frame_rate",
+             "-show_format", "-show_streams", "-of", "json", str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=_PROBE_TIMEOUT_SECONDS, check=False,
         )
@@ -408,6 +609,14 @@ def _positive_probe_int(value: Any, name: str) -> int:
     return number
 
 
+def _dimensions(width_value: Any, height_value: Any, name: str) -> tuple[int, int]:
+    width = _positive_probe_int(width_value, f"{name} width")
+    height = _positive_probe_int(height_value, f"{name} height")
+    if width > 16_384 or height > 16_384 or width * height > 100_000_000:
+        raise ValueError(f"FFprobe returned unsupported {name} dimensions")
+    return width, height
+
+
 def _duration(probe: dict[str, Any], stream: dict[str, Any]) -> float | None:
     value = stream.get("duration", probe.get("format", {}).get("duration"))
     if value in (None, "N/A"):
@@ -416,6 +625,18 @@ def _duration(probe: dict[str, Any], stream: dict[str, Any]) -> float | None:
         duration = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("FFprobe returned invalid media duration") from exc
-    if not 0 < duration < float("inf"):
+    if not 0 < duration <= 24 * 60 * 60:
         raise ValueError("FFprobe returned invalid media duration")
     return duration
+
+
+def _frame_rate(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, str) or value in {"", "0/0", "N/A"}:
+        return None
+    try:
+        rate = Fraction(value)
+    except (ValueError, ZeroDivisionError):
+        raise ValueError("FFprobe returned invalid frame rate")
+    if rate <= 0 or rate > 1000:
+        raise ValueError("FFprobe returned unsupported frame rate")
+    return rate.numerator, rate.denominator
