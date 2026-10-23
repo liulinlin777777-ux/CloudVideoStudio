@@ -106,11 +106,7 @@ class AssetStore:
         if containing:
             anchor = max(containing, key=lambda item: len(item.parts))
         else:
-            anchor = target
-            while not anchor.exists() and anchor.parent != anchor:
-                anchor = anchor.parent
-            if anchor.is_file():
-                anchor = anchor.parent
+            anchor = Path(target.anchor)
         try:
             relative_parts = target.relative_to(anchor).parts
         except ValueError as exc:

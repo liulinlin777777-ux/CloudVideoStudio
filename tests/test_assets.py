@@ -77,6 +77,18 @@ class AssetStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink"):
                 AssetStore(root / "store").import_file(alias / source.name)
 
+    def test_rejects_symlinked_ancestor_outside_working_directory_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actual = root / "actual"
+            (actual / "deep").mkdir(parents=True)
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            unrelated_anchor = root / "unrelated"
+            with patch.object(Path, "cwd", return_value=unrelated_anchor):
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    AssetStore(alias / "deep" / "new" / "store")
+
     def test_copy_digest_tracks_the_bytes_actually_stored(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
