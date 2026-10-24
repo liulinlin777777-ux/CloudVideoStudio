@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from fractions import Fraction
 import hashlib
+import json
 import math
 from pathlib import Path
+import re
 import resource
 import subprocess
 import time
@@ -124,6 +126,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         "subtitle": {"asset_id", "start_frame", "duration_frames", "position", "font_size", "color"},
         "mute": {"enabled"},
         "fade": {"in_frames", "out_frames"},
+        "normalize": {"enabled"},
     }
 
     def filter_seconds(frames: int) -> str:
@@ -141,8 +144,10 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             if len(track_kinds) != len(set(track_kinds)):
                 raise ValueError(f"track {track.id} has duplicate effects")
             for effect in track.effects:
-                if effect.kind not in {"volume", "mute", "fade"} or set(effect.parameters) != expected[effect.kind]:
-                    raise ValueError("audio track effects support only volume, mute and fade")
+                if effect.kind not in {"volume", "mute", "fade", "normalize"} or set(effect.parameters) != expected[effect.kind]:
+                    raise ValueError("audio track effects support only volume, mute, fade and normalization")
+                if effect.kind == "normalize" and type(effect.parameters["enabled"]) is not bool:
+                    raise ValueError("normalize enabled must be a boolean")
         ordered = sorted(track.clips, key=lambda item: (item.start_frame, item.id))
         if track.kind == "audio" and any(_effect(clip, "pip") or _effect(clip, "crossfade") for clip in ordered):
             raise ValueError("audio tracks do not support video effects")
@@ -173,13 +178,11 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             for effect in clip.effects:
                 if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
                     raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
-                if track.kind == "audio" and effect.kind not in {"volume", "mute", "fade", "crossfade"}:
+                if track.kind == "audio" and effect.kind not in {"volume", "mute", "fade", "normalize", "crossfade"}:
                     raise ValueError("audio tracks only support volume, mute and fades")
                 if track.kind == "video" and effect.kind in {"volume", "mute", "fade"}:
                     raise ValueError("video clips do not support audio effects")
             pip = _effect(clip, "pip")
-            if pip is not None and _effect(clip, "crop") is not None:
-                raise ValueError("crop and PIP must be applied in separate clips")
             if pip is not None:
                 values = {}
                 for key, maximum in (("x", sequence.width), ("y", sequence.height),
@@ -232,22 +235,45 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             label = f"vclip{track_index}_{clip_index}"
             start_time = filter_seconds(clip.start_frame)
             pip = _effect(clip, "pip")
-            out_width = pip.parameters["width"] if pip else sequence.width
-            out_height = pip.parameters["height"] if pip else sequence.height
             graph.append(
                 f"[{indexes[clip.asset_id]}:v]fps={fps},"
                 f"trim=start_frame={clip.source_in_frame}:"
                 f"end_frame={clip.source_in_frame + clip.duration_frames},"
                 f"setpts=N*{sequence.fps_den}/{sequence.fps_num}/TB+"
                 f"{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
-                f"scale={out_width}:{out_height},setsar=1,fps={fps},"
+                f"scale={sequence.width}:{sequence.height},setsar=1,fps={fps},"
                 f"format=yuva420p[{label}]"
             )
-            clip_filters = video_effect_filters(clip, sequence, filter_seconds, uri_by_id)
+            all_clip_filters = video_effect_filters(clip, sequence, filter_seconds, uri_by_id)
+            subtitle_filters = [item for item in all_clip_filters if item.startswith("subtitles=")]
+            clip_filters = [item for item in all_clip_filters if not item.startswith("subtitles=")]
             if clip_filters:
                 filtered = label + "fx"
                 graph.append(f"[{label}]" + ",".join(clip_filters) + f"[{filtered}]")
                 label = filtered
+            if subtitle_filters:
+                subtitle = next(effect for effect in clip.effects if effect.kind == "subtitle")
+                begin = filter_seconds(clip.start_frame + subtitle.parameters["start_frame"])
+                end = filter_seconds(
+                    clip.start_frame + subtitle.parameters["start_frame"] + subtitle.parameters["duration_frames"]
+                )
+                subtitle_label = label + "subtitle"
+                graph.append(
+                    f"color=c=black@0:s={sequence.width}x{sequence.height}:r={fps}:"
+                    f"d={filter_seconds(clip.duration_frames)},format=rgba,"
+                    f"setpts=PTS+{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
+                    f"trim=start={begin}:end={end},{subtitle_filters[0]}[{subtitle_label}]"
+                )
+                captioned = label + "captioned"
+                graph.append(
+                    f"[{label}][{subtitle_label}]overlay=eof_action=pass:shortest=0:format=auto:"
+                    f"enable='between(t\\,{begin}\\,{end})'[{captioned}]"
+                )
+                label = captioned
+            if pip is not None:
+                scaled = label + "pipscale"
+                graph.append(f"[{label}]scale={pip.parameters['width']}:{pip.parameters['height']}[{scaled}]")
+                label = scaled
             fade = _effect(clip, "crossfade")
             if fade is not None:
                 seconds = filter_seconds(fade.parameters["duration_frames"])
@@ -267,9 +293,16 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
 
     audio_labels = []
     audio_index = 0
+    normalize_audio = False
     for track in sequence.tracks:
         if track.kind != "audio":
             continue
+        normalize_audio = normalize_audio or any(
+            effect.kind == "normalize" and effect.parameters["enabled"] for effect in track.effects
+        ) or any(
+            effect.kind == "normalize" and effect.parameters["enabled"]
+            for clip in track.clips for effect in clip.effects
+        )
         for clip in sorted(track.clips, key=lambda item: (item.start_frame, item.id)):
             label = f"aclip{audio_index}"
             start_sample = sample_index(clip.source_in_frame)
@@ -294,6 +327,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
     if audio_labels:
         graph.append("".join(f"[{label}]" for label in audio_labels) +
                      f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
+                     + ("loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json," if normalize_audio else "") +
                      "alimiter=limit=0.95,"
                      f"atrim=end_sample={sample_index(duration_frames)},"
                      "asetpts=N/SR/TB[aout]")
@@ -303,13 +337,14 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         "inputs": inputs, "filtergraph": ";".join(graph),
         "duration_frames": duration_frames, "fps": fps,
         "width": sequence.width, "height": sequence.height,
+        "audio_normalization": normalize_audio,
     }
 
 
 def compile_timeline(project: Project) -> dict[str, Any]:
     """Compile the explicitly supported two-video/two-audio demo topology."""
     project.validate()
-    p2c_effects = {"color", "crop", "title", "subtitle", "mute", "fade"}
+    p2c_effects = {"color", "crop", "title", "subtitle", "mute", "fade", "normalize"}
     if (any(track.effects for sequence in project.sequences for track in sequence.tracks)
             or any(effect.kind in p2c_effects for sequence in project.sequences
                    for track in sequence.tracks for clip in track.clips for effect in clip.effects)):
@@ -621,6 +656,14 @@ def render_project(
     cpu_seconds = (
         after_cpu.ru_utime + after_cpu.ru_stime - before_cpu.ru_utime - before_cpu.ru_stime
     )
+    loudness = None
+    if compiled.get("audio_normalization"):
+        match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', result.stderr, re.DOTALL)
+        if match:
+            try:
+                loudness = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                loudness = None
     return {
         "status": "completed",
         "wall_seconds": wall_seconds,
@@ -628,4 +671,5 @@ def render_project(
         "output_bytes": target.stat().st_size,
         "source_hashes_before": hashes_before,
         "source_hashes_after": hashes_after,
+        "audio_loudness": loudness,
     }

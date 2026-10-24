@@ -145,9 +145,37 @@ class IndependentRegressionTests(unittest.TestCase):
         }))
         graph = compile_timeline(project)['filtergraph']
         self.assertIn(r"x\'\;movie\=bad", graph)
+        self.assertIn('expansion=none', graph)
+        self.assertIn("font='Sans'", graph)
+        self.assertIn(r"enable='between(t\,0\,0.333667)'", graph)
         project.sequences[0].tracks[0].clips[0].effects[0].parameters['font_size'] = 1000
         with self.assertRaises(ValueError):
             compile_timeline(project)
+
+    def test_subtitle_uses_libass_timing_and_a_timed_overlay(self):
+        project = make_demo_project()
+        project.assets.append(Asset('captions', 'assets/files/0123456789abcdef0123456789abcdef.srt', 150,
+                                  {'version': 2, 'kind': 'subtitle'}))
+        project.sequences[0].tracks[0].clips[0].effects.append(Effect('subtitle', {
+            'asset_id': 'captions', 'start_frame': 5, 'duration_frames': 20,
+            'position': 'bottom', 'font_size': 24, 'color': '#ffffff',
+        }))
+        graph = compile_timeline(project)['filtergraph']
+        self.assertIn('subtitles=filename=', graph)
+        self.assertNotIn("MarginV=24':enable=", graph)
+        self.assertIn('color=c=black@0', graph)
+        self.assertIn("overlay=eof_action=pass:shortest=0:format=auto:enable=", graph)
+
+    def test_crop_and_pip_compose_and_loudness_is_measured_when_requested(self):
+        project = make_demo_project()
+        pip_clip = project.sequences[0].tracks[1].clips[0]
+        pip_clip.effects.append(Effect('crop', {'x': 0, 'y': 0, 'width': 320, 'height': 180}))
+        project.sequences[0].tracks[2].effects.append(Effect('normalize', {'enabled': True}))
+        compiled = compile_timeline(project)
+        self.assertIn('crop=320:180:0:0,scale=640:360', compiled['filtergraph'])
+        self.assertIn('scale=160:90', compiled['filtergraph'])
+        self.assertIn('loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json', compiled['filtergraph'])
+        self.assertTrue(compiled['audio_normalization'])
 
     def test_audio_track_treatment_is_versioned_and_applies_to_all_clips(self):
         project = make_demo_project()

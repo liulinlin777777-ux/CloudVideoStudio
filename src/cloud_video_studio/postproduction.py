@@ -81,8 +81,9 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
             begin = frame_time(clip.start_frame + start)
             end = frame_time(clip.start_frame + start + duration)
             filters.append(
-                f"drawtext=text='{text}':x={x}:y={y}:fontsize={size}:fontcolor={color}"
-                f":enable='between(t,{begin},{end})'"
+                f"drawtext=font='Sans':text='{text}':expansion=none:x={x}:y={y}:"
+                f"fontsize={size}:fontcolor={color}"
+                f":enable='between(t\\,{begin}\\,{end})'"
             )
         elif effect.kind == 'subtitle':
             required = {'asset_id', 'start_frame', 'duration_frames', 'position', 'font_size', 'color'}
@@ -106,8 +107,7 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
             end = frame_time(clip.start_frame + start + duration)
             filters.append(
                 f"subtitles=filename='{uri}':charenc=UTF-8:force_style='FontSize={size},PrimaryColour=&H00{color[5:7]}{color[3:5]}{color[1:3]},"
-                f"Alignment={ {'bottom': 2, 'center': 5, 'top': 8}[position] },MarginV={margin_v}'"
-                f":enable='between(t,{begin},{end})'"
+                f"FontName=Arial,Alignment={ {'bottom': 2, 'center': 5, 'top': 8}[position] },MarginV={margin_v}'"
             )
         elif effect.kind not in ('crossfade', 'pip'):
             raise ValueError(f"unsupported video effect: {effect.kind}")
@@ -126,6 +126,9 @@ def audio_effect_values(clip: Clip, track_effects=()) -> tuple[float, bool, int,
             if set(p) != {'enabled'} or type(p['enabled']) is not bool:
                 raise ValueError("mute requires a boolean enabled value")
             muted = muted or p['enabled']
+        elif effect.kind == 'normalize':
+            if set(p) != {'enabled'} or type(p['enabled']) is not bool:
+                raise ValueError("normalize requires a boolean enabled value")
         elif effect.kind == 'fade':
             if set(p) != {'in_frames', 'out_frames'}:
                 raise ValueError("fade requires in_frames and out_frames")

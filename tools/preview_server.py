@@ -318,8 +318,8 @@ class Handler(BaseHTTPRequestHandler):
                     if scope == 'track':
                         if track.kind != 'audio':
                             raise ValueError('track-level post-production is supported for audio tracks')
-                        if any(effect.kind not in {'volume', 'mute', 'fade'} for effect in effects):
-                            raise ValueError('audio tracks support volume, mute and fade')
+                        if any(effect.kind not in {'volume', 'mute', 'fade', 'normalize'} for effect in effects):
+                            raise ValueError('audio tracks support volume, mute, fade and normalization')
                         track.effects = effects
                     else:
                         clip.effects = effects
@@ -363,6 +363,7 @@ class Handler(BaseHTTPRequestHandler):
                     'wall_seconds': receipt['wall_seconds'], 'cpu_seconds': receipt['cpu_seconds'],
                     'output_bytes': receipt['output_bytes'], 'fps': compiled['fps'],
                     'duration_frames': compiled['duration_frames'],
+                    'audio_loudness': receipt['audio_loudness'],
                 })
             finally:
                 lock.release()
