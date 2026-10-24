@@ -93,14 +93,11 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
                 raise ValueError("title color must be a six-digit hex color")
             start = integer(p['start_frame'], 'title start_frame', 0, clip.duration_frames - 1)
             duration = integer(p['duration_frames'], 'title duration_frames', 1, clip.duration_frames - start)
-            begin = frame_time(start)
-            end = frame_time(start + duration)
-            clip_origin = frame_time(clip.start_frame)
-            local_time = "t" if clip_origin == "0" else f"t-{clip_origin}"
+            last_frame = start + duration - 1
             filters.append(
                 f"drawtext=font='{family}':textfile='{title_file_token(clip)}':expansion=none:x={x}:y={y}:"
                 f"fontsize={size}:fontcolor={color}"
-                f":enable='gte({local_time}\\,{begin})*lt({local_time}\\,{end})'"
+                f":enable='between(n\\,{start}\\,{last_frame})'"
             )
         elif effect.kind == 'subtitle':
             required = {'asset_id', 'start_frame', 'duration_frames', 'position', 'font_size', 'color'}
@@ -125,8 +122,8 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
             begin = frame_time(start)
             end = frame_time(start + duration)
             filters.append(
-                f"subtitles=filename='{uri}':charenc=UTF-8:force_style='FontSize={size},PrimaryColour=&H00{color[5:7]}{color[3:5]}{color[1:3]},"
-                f"FontName=Arial,Alignment={ {'bottom': 2, 'center': 5, 'top': 8}[position] },MarginV={margin_v}'"
+                f"subtitles=filename='{uri}':alpha=1:charenc=UTF-8:force_style='FontSize={size},PrimaryColour=&H00{color[5:7]}{color[3:5]}{color[1:3]},"
+                f"FontName=Arial,Alignment={ {'bottom': 2, 'center': 9, 'top': 6}[position] },MarginV={margin_v}'"
             )
         elif effect.kind not in ('crossfade', 'pip'):
             raise ValueError(f"unsupported video effect: {effect.kind}")

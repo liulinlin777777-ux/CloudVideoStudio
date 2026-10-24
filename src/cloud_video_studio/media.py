@@ -256,26 +256,20 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
                 label = filtered
             if subtitle_filters:
                 subtitle = next(effect for effect in clip.effects if effect.kind == "subtitle")
-                local_begin = filter_seconds(subtitle.parameters["start_frame"])
-                local_end = filter_seconds(
-                    subtitle.parameters["start_frame"] + subtitle.parameters["duration_frames"]
-                )
-                begin = filter_seconds(clip.start_frame + subtitle.parameters["start_frame"])
-                end = filter_seconds(
-                    clip.start_frame + subtitle.parameters["start_frame"] + subtitle.parameters["duration_frames"]
-                )
+                caption_start = subtitle.parameters["start_frame"]
+                caption_end = caption_start + subtitle.parameters["duration_frames"]
                 subtitle_label = label + "subtitle"
                 graph.append(
                     f"color=c=black@0:s={sequence.width}x{sequence.height}:r={fps}:"
                     f"d={filter_seconds(clip.duration_frames)},format=yuva420p,geq=r=0:g=0:b=0:a=0,"
                     f"setpts=PTS-STARTPTS,{subtitle_filters[0]},"
-                    f"trim=start={local_begin}:end={local_end},"
+                    f"trim=start_frame={caption_start}:end_frame={caption_end},"
                     f"setpts=PTS+{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB[{subtitle_label}]"
                 )
                 captioned = label + "captioned"
                 graph.append(
                     f"[{label}][{subtitle_label}]overlay=eof_action=pass:shortest=0:format=auto:"
-                    f"enable='gte(t\\,{begin})*lt(t\\,{end})'[{captioned}]"
+                    f"enable='between(n\\,{caption_start}\\,{caption_end - 1})'[{captioned}]"
                 )
                 label = captioned
             if pip is not None:
@@ -333,22 +327,12 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             audio_labels.append(label)
             audio_index += 1
     if audio_labels:
-        mix_filters = [
-            f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0",
-        ]
+        mix_filters = [f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0"]
         if normalize_audio:
-            mix_filters.append("loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json")
-            mix_filters.append("aresample=48000")
-        mix_filters.extend([
-            "alimiter=limit=0.95:level=false",
-            f"atrim=end_sample={sample_index(duration_frames)}",
-            "asetpts=N/SR/TB",
-        ])
-        graph.append(
-            "".join(f"[{label}]" for label in audio_labels)
-            + ",".join(mix_filters)
-            + "[aout]"
-        )
+            mix_filters.extend(["loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "aresample=48000"])
+        mix_filters.extend(["alimiter=limit=0.95:level=false",
+                            f"atrim=end_sample={sample_index(duration_frames)}", "asetpts=N/SR/TB"])
+        graph.append("".join(f"[{label}]" for label in audio_labels) + ",".join(mix_filters) + "[aout]")
     else:
         graph.append(f"anullsrc=r=48000:cl=stereo,atrim=end_sample={sample_index(duration_frames)}[aout]")
     return {
@@ -614,11 +598,11 @@ def _audio_qa_graph(graph: str) -> str:
     """Attach analysis to the compiled complex graph's final audio output."""
     if not graph.endswith("[aout]"):
         raise ValueError("compiled graph must end with [aout]")
-    return f"{graph};[aout]astats=metadata=0:reset=0[aqa]"
+    return f"{graph};[aout]ebur128=peak=true,astats=metadata=0:reset=0,silencedetect=noise=-50dB:d=0.5[aqa]"
 
 
-def _parse_audio_qa(stderr: str) -> dict[str, float | None]:
-    measurements: dict[str, float | None] = {}
+def _parse_audio_qa(stderr: str) -> dict[str, Any]:
+    measurements: dict[str, Any] = {}
     for key, label in (("peak_level_db", "Peak level dB"), ("rms_level_db", "RMS level dB")):
         values = re.findall(rf"{label}:\s*(-?inf|[-+]?\d+(?:\.\d+)?)", stderr)
         if not values:
@@ -626,7 +610,56 @@ def _parse_audio_qa(stderr: str) -> dict[str, float | None]:
         value = values[-1]
         # JSON has no representation for infinity. null denotes silence.
         measurements[key] = None if value.lower() == "-inf" else float(value)
+    number = r"(-?inf|[-+]?\d+(?:\.\d+)?)"
+    for key, pattern in (("integrated_lufs", rf"\bI:\s*{number}\s+LUFS"),
+                         ("true_peak_dbfs", rf"\bPeak:\s*{number}\s+dBFS")):
+        values = re.findall(pattern, stderr)
+        if values:
+            measurements[key] = None if values[-1] == "-inf" else float(values[-1])
+    counts = re.findall(r"Number of samples:\s*(\d+(?:\.\d+)?)", stderr)
+    if counts:
+        measurements["sample_count"] = int(float(counts[-1]))
+    starts = re.findall(r"silence_start:\s*([-+]?\d+(?:\.\d+)?)", stderr)
+    ends = re.findall(r"silence_end:\s*([-+]?\d+(?:\.\d+)?)", stderr)
+    if starts:
+        measurements["silence_segments"] = [
+            {"start": float(value), "end": float(ends[i]) if i < len(ends) else None}
+            for i, value in enumerate(starts)
+        ]
     return measurements
+
+
+def _complete_audio_qa(measurements, project, compiled):
+    qa = dict(measurements)
+    sequence = project.sequences[0]
+    duration = float(sequence.frame_time(compiled["duration_frames"]))
+    samples = sequence.frame_time(compiled["duration_frames"]) * 48000
+    expected = (2 * samples.numerator + samples.denominator) // (2 * samples.denominator)
+    qa["expected_sample_count"] = expected
+    observed = qa.get("sample_count")
+    qa["audio_duration_seconds"] = observed / 48000 if observed is not None else None
+    qa["video_duration_seconds"] = duration
+    qa["duration_delta_ms"] = (observed - expected) * 1000 / 48000 if observed is not None else None
+    qa["timeline_sample_alignment"] = ("NOT_VERIFIED" if observed is None else
+        "PASS" if abs(observed - expected) <= 48000 * float(sequence.frame_time(1)) else "WARN")
+    qa["measurement_status"] = "MEASURED" if observed is not None and "integrated_lufs" in qa else "PARTIAL"
+    peaks = [qa.get(key) for key in ("true_peak_dbfs", "peak_level_db")]
+    qa["clipping_detected"] = any(value is not None and value >= 0 for value in peaks)
+    active = []
+    for track in sequence.tracks:
+        if track.kind == "audio":
+            for clip in track.clips:
+                if audio_effect_values(clip, track.effects)[0] > 0:
+                    active.append((float(sequence.frame_time(clip.start_frame)),
+                                   float(sequence.frame_time(clip.start_frame + clip.duration_frames))))
+    qa["silence_expected"] = not active
+    segments = qa.setdefault("silence_segments", [])
+    for segment in segments:
+        end = segment["end"] if segment["end"] is not None else (qa["audio_duration_seconds"] or duration)
+        overlap = sum(max(0., min(end, b) - max(segment["start"], a)) for a, b in active)
+        segment["unexpected"] = overlap > float(sequence.frame_time(1))
+    qa["unexpected_silence"] = any(segment["unexpected"] for segment in segments)
+    return qa
 
 
 def render_project(
@@ -682,7 +715,7 @@ def render_project(
         for index, (token, text) in enumerate(compiled.get("title_texts", {}).items()):
             text_path = Path(title_directory) / f"title-{index:02d}.txt"
             text_path.write_text(text, encoding="utf-8", newline="")
-            graph = graph.replace(token, _filter_path(text_path))
+            graph = graph.replace(token, _filter_path(text_path.relative_to(root_path)))
         if "__CVS_TITLE_" in graph:
             raise ValueError("title text file token was not staged")
 
@@ -702,7 +735,7 @@ def render_project(
             raise RuntimeError("pre-export audio QA timed out") from exc
         if qa_result.returncode != 0:
             raise RuntimeError(f"pre-export audio QA failed: {qa_result.stderr.strip()}")
-        measurements = _parse_audio_qa(qa_result.stderr)
+        measurements = _complete_audio_qa(_parse_audio_qa(qa_result.stderr), project, compiled)
 
         command = [
             ffmpeg, "-nostdin", "-n", *inputs,
