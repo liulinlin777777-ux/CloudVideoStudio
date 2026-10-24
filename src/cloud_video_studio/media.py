@@ -662,6 +662,29 @@ def _complete_audio_qa(measurements, project, compiled):
     return qa
 
 
+def _encoded_audio_qa(path: Path, *, ffmpeg: str, timeout: float) -> dict[str, Any]:
+    """Measure decoded AAC, since a safe input peak does not prove codec output."""
+    try:
+        result = subprocess.run([ffmpeg, "-nostdin", "-i", str(path), "-vn",
+                                 "-af", "ebur128=peak=true,astats=metadata=0:reset=0,silencedetect=noise=-50dB:d=0.5",
+                                 "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=min(float(timeout),45.0), check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("encoded audio QA timed out") from error
+    if result.returncode != 0:
+        raise RuntimeError("encoded audio QA failed")
+    try:
+        measurements = _parse_audio_qa(result.stderr)
+    except RuntimeError as error:
+        raise RuntimeError("encoded audio QA is incomplete") from error
+    if "sample_count" not in measurements or "integrated_lufs" not in measurements:
+        raise RuntimeError("encoded audio QA is incomplete")
+    if any(measurements.get(key) is not None and measurements[key] >= 0
+           for key in ("peak_level_db", "true_peak_dbfs")):
+        raise ValueError("ENCODED_AUDIO_CLIPPING_DETECTED_NORMALIZE_REQUIRED")
+    return measurements
+
+
 def _title_font_family(family: str, text: str) -> str:
     """Resolve CJK glyph coverage with installed fontconfig, never user paths."""
     if not any(0x3400 <= ord(char) <= 0x9fff or 0xf900 <= ord(char) <= 0xfaff for char in text):
@@ -775,22 +798,24 @@ def render_project(
             "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
             "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-movflags", "+faststart", str(target),
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(target),
         ]
         try:
             result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                     timeout=timeout, check=False, cwd=root_path)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("FFmpeg render timed out") from exc
-    wall_seconds = time.monotonic() - started
-    after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg render failed: {result.stderr.strip()}")
     if not target.is_file() or target.stat().st_size <= 0:
         raise RuntimeError("FFmpeg produced an empty output")
+    encoded_measurements = _complete_audio_qa(
+        _encoded_audio_qa(target, ffmpeg=ffmpeg, timeout=timeout), project, compiled)
     hashes_after = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
     if hashes_after != hashes_before:
         raise RuntimeError("FFmpeg modified one or more source assets")
+    wall_seconds = time.monotonic() - started
+    after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_seconds = (
         after_cpu.ru_utime + after_cpu.ru_stime - before_cpu.ru_utime - before_cpu.ru_stime
     )
@@ -811,4 +836,5 @@ def render_project(
         "source_hashes_after": hashes_after,
         "audio_loudness": loudness,
         "audio_qa": measurements,
+        "encoded_audio_qa": encoded_measurements,
     }

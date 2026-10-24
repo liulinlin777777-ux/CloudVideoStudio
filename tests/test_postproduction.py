@@ -316,3 +316,25 @@ class PreviewRangeRegression(unittest.TestCase):
             code,body,headers=self.request(value)
             with self.subTest(value=value):
                 self.assertEqual(code,416);self.assertEqual(body,b"");self.assertEqual(headers["Content-Range"],"bytes */10")
+
+
+class EncodedAudioQaRegression(unittest.TestCase):
+    def test_encoded_clipping_is_rejected_after_aac_decode(self):
+        from cloud_video_studio.media import _encoded_audio_qa
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        log="Peak level dB: 2.0\nRMS level dB: -8.0\nI: -10.0 LUFS\nPeak: 2.0 dBFS\nNumber of samples: 192000"
+        with patch("cloud_video_studio.media.subprocess.run",return_value=SimpleNamespace(returncode=0,stderr=log)):
+            with self.assertRaisesRegex(ValueError,"ENCODED_AUDIO_CLIPPING_DETECTED"):
+                _encoded_audio_qa(Path("owned.mp4"),ffmpeg="ffmpeg",timeout=5)
+    def test_encoded_measurements_are_real_complete_and_json_safe(self):
+        from cloud_video_studio.media import _encoded_audio_qa
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        log="Peak level dB: -inf\nRMS level dB: -inf\nI: -70.0 LUFS\nPeak: -inf dBFS\nNumber of samples: 192000"
+        with patch("cloud_video_studio.media.subprocess.run",return_value=SimpleNamespace(returncode=0,stderr=log)):
+            result=_encoded_audio_qa(Path("owned.mp4"),ffmpeg="ffmpeg",timeout=5)
+            self.assertIsNone(result["peak_level_db"]);json.dumps(result,allow_nan=False)
+        with patch("cloud_video_studio.media.subprocess.run",return_value=SimpleNamespace(returncode=0,stderr="")):
+            with self.assertRaisesRegex(RuntimeError,"incomplete"):
+                _encoded_audio_qa(Path("owned.mp4"),ffmpeg="ffmpeg",timeout=5)
