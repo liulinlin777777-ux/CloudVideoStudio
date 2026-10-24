@@ -281,3 +281,38 @@ class FontCoverageRegression(unittest.TestCase):
         from types import SimpleNamespace
         with patch("cloud_video_studio.media.subprocess.run", return_value=SimpleNamespace(stdout="Noto Sans CJK SC\n20-7e 4e00-9fff")):
             self.assertEqual(_title_font_family("Sans", "中文 title"),"Noto Sans CJK SC")
+
+
+class PreviewRangeRegression(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import tempfile,runpy,sys
+        from unittest.mock import patch
+        cls.temporary=tempfile.TemporaryDirectory()
+        cls.root=Path(cls.temporary.name)
+        with patch.object(sys,"argv",["preview_server.py","--media-root",str(cls.root),"--port","18776"]),patch("http.server.ThreadingHTTPServer"):
+            module=runpy.run_path("tools/preview_server.py",run_name="range_contract")
+        cls.handler=module["Handler"]
+        cls.parser=staticmethod(module["parse_byte_range"])
+        (cls.root/"render.mp4").write_bytes(b"0123456789")
+    @classmethod
+    def tearDownClass(cls):cls.temporary.cleanup()
+    def request(self,value):
+        from email.message import Message
+        h=object.__new__(self.handler);h.headers=Message()
+        if value is not None:h.headers["Range"]=value
+        calls=[]
+        h.reply=lambda code,body,kind="application/json",headers=None:calls.append((code,body,headers))
+        h.media("render.mp4")
+        return calls[0]
+    def test_normal_open_closed_and_suffix(self):
+        self.assertEqual(self.request(None),(200,b"0123456789",{"Accept-Ranges":"bytes"}))
+        self.assertEqual(self.request("bytes=2-4"),(206,b"234",{"Accept-Ranges":"bytes","Content-Range":"bytes 2-4/10"}))
+        self.assertEqual(self.request("bytes=8-")[1],b"89")
+        self.assertEqual(self.request("bytes=-3")[1],b"789")
+        self.assertEqual(self.request("bytes=0-99")[1],b"0123456789")
+    def test_malformed_and_unsatisfiable_fail_closed(self):
+        for value in ["bytes=10-","bytes=4-2","bytes=-0","bytes=0-1,4-5","bytes=-","items=1-2","bytes="+"9"*200+"-"]:
+            code,body,headers=self.request(value)
+            with self.subTest(value=value):
+                self.assertEqual(code,416);self.assertEqual(body,b"");self.assertEqual(headers["Content-Range"],"bytes */10")

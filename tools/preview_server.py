@@ -51,16 +51,41 @@ def decode_project(data):
     return project
 
 
+def parse_byte_range(value, size):
+    """One RFC byte range for immutable preview files; reject multipart ranges."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 128 or not value.startswith("bytes="):
+        raise ValueError("unsupported byte range")
+    parts = value[6:].split("-")
+    if len(parts) != 2 or not any(parts) or size <= 0:
+        raise ValueError("invalid byte range")
+    if any(part and (not part.isascii() or not part.isdigit()) for part in parts):
+        raise ValueError("invalid byte range")
+    if not parts[0]:
+        count = int(parts[1])
+        if count <= 0:
+            raise ValueError("invalid suffix range")
+        return max(0, size - count), size - 1
+    start = int(parts[0])
+    end = int(parts[1]) if parts[1] else size - 1
+    if start >= size or end < start:
+        raise ValueError("unsatisfiable byte range")
+    return start, min(end, size - 1)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, code, body, kind='application/json'):
+    def reply(self, code, body, kind='application/json', headers=None):
         data = json.dumps(body).encode() if kind == 'application/json' else body
         self.send_response(code)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -116,7 +141,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not file.is_file():
                 return self.reply(404, {'error': 'NOT_FOUND'})
-            return self.reply(200, file.read_bytes(), 'video/mp4')
+            data = file.read_bytes()
+            headers = {'Accept-Ranges': 'bytes'}
+            try:
+                span = parse_byte_range(self.headers.get('Range'), len(data))
+            except ValueError:
+                headers['Content-Range'] = f'bytes */{len(data)}'
+                return self.reply(416, b'', 'video/mp4', headers)
+            if span is None:
+                return self.reply(200, data, 'video/mp4', headers)
+            start, end = span
+            headers['Content-Range'] = f'bytes {start}-{end}/{len(data)}'
+            return self.reply(206, data[start:end + 1], 'video/mp4', headers)
         except OSError:
             return self.reply(404, {'error': 'NOT_FOUND'})
 
