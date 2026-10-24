@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from .project import Asset, Clip, Effect, Project, Sequence, Track
+from .postproduction import audio_effect_values, video_effect_filters
 
 
 def make_demo_project() -> Project:
@@ -117,10 +118,31 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         "crossfade": {"duration_frames"},
         "pip": {"x", "y", "width", "height"},
         "volume": {"gain"},
+        "color": {"brightness", "contrast", "saturation"},
+        "crop": {"x", "y", "width", "height"},
+        "title": {"text", "x", "y", "font_size", "color", "start_frame", "duration_frames"},
+        "subtitle": {"asset_id", "start_frame", "duration_frames", "position", "font_size", "color"},
+        "mute": {"enabled"},
+        "fade": {"in_frames", "out_frames"},
     }
+
+    def filter_seconds(frames: int) -> str:
+        micros = sequence.frame_time(frames) * 1_000_000
+        rounded = (2 * micros.numerator + micros.denominator) // (2 * micros.denominator)
+        whole, fractional = divmod(rounded, 1_000_000)
+        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
     for track in sequence.tracks:
         if track.kind not in {"video", "audio"}:
             raise ValueError("unsupported track kind")
+        if track.effects:
+            if track.kind != "audio":
+                raise ValueError("only audio tracks support track-level effects")
+            track_kinds = [effect.kind for effect in track.effects]
+            if len(track_kinds) != len(set(track_kinds)):
+                raise ValueError(f"track {track.id} has duplicate effects")
+            for effect in track.effects:
+                if effect.kind not in {"volume", "mute", "fade"} or set(effect.parameters) != expected[effect.kind]:
+                    raise ValueError("audio track effects support only volume, mute and fade")
         ordered = sorted(track.clips, key=lambda item: (item.start_frame, item.id))
         if track.kind == "audio" and any(_effect(clip, "pip") or _effect(clip, "crossfade") for clip in ordered):
             raise ValueError("audio tracks do not support video effects")
@@ -151,11 +173,13 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             for effect in clip.effects:
                 if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
                     raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
-                if track.kind == "audio" and effect.kind != "volume":
-                    raise ValueError("audio clips only support volume")
-                if track.kind == "video" and effect.kind == "volume":
-                    raise ValueError("video clips do not support volume")
+                if track.kind == "audio" and effect.kind not in {"volume", "mute", "fade", "crossfade"}:
+                    raise ValueError("audio tracks only support volume, mute and fades")
+                if track.kind == "video" and effect.kind in {"volume", "mute", "fade"}:
+                    raise ValueError("video clips do not support audio effects")
             pip = _effect(clip, "pip")
+            if pip is not None and _effect(clip, "crop") is not None:
+                raise ValueError("crop and PIP must be applied in separate clips")
             if pip is not None:
                 values = {}
                 for key, maximum in (("x", sequence.width), ("y", sequence.height),
@@ -168,20 +192,28 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
                         values["x"] + values["width"] > sequence.width or
                         values["y"] + values["height"] > sequence.height):
                     raise ValueError("pip rectangle is outside the sequence")
+                if any(value % 2 for value in values.values()):
+                    raise ValueError("pip coordinates and dimensions must be even for 4:2:0 video")
             if track.kind == "audio":
-                volume = _effect(clip, "volume")
-                if volume is not None:
-                    _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0)
+                audio_effect_values(clip, track.effects)
+            if track.kind == "video":
+                uri_by_id = {asset.id: asset.uri for asset in project.assets}
+                for effect in clip.effects:
+                    if effect.kind == "subtitle":
+                        subtitle_asset = next((asset for asset in project.assets if asset.id == effect.parameters.get("asset_id")), None)
+                        if (subtitle_asset is None or not subtitle_asset.uri.lower().endswith('.srt')
+                                or subtitle_asset.metadata.get('kind') != 'subtitle'):
+                            raise ValueError("subtitle effect must reference an imported .srt asset")
+                video_effect_filters(clip, sequence, lambda frame: filter_seconds(frame), uri_by_id)
 
-    inputs = list(dict.fromkeys(clip.asset_id for clip in all_clips))
+    inputs = list(dict.fromkeys(
+        [clip.asset_id for clip in all_clips] + [
+            effect.parameters["asset_id"] for clip in all_clips for effect in clip.effects
+            if effect.kind == "subtitle" and isinstance(effect.parameters.get("asset_id"), str)
+        ]
+    ))
     indexes = {asset_id: index for index, asset_id in enumerate(inputs)}
     fps = f"{sequence.fps_num}/{sequence.fps_den}"
-
-    def filter_seconds(frames: int) -> str:
-        micros = sequence.frame_time(frames) * 1_000_000
-        rounded = (2 * micros.numerator + micros.denominator) // (2 * micros.denominator)
-        whole, fractional = divmod(rounded, 1_000_000)
-        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
 
     def sample_index(frames: int) -> int:
         samples = sequence.frame_time(frames) * 48000
@@ -194,6 +226,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
     base = "vbase0"
     node = 1
     video_tracks = [track for track in sequence.tracks if track.kind == "video"]
+    uri_by_id = {asset.id: asset.uri for asset in project.assets}
     for track_index, track in enumerate(video_tracks):
         for clip_index, clip in enumerate(sorted(track.clips, key=lambda item: (item.start_frame, item.id))):
             label = f"vclip{track_index}_{clip_index}"
@@ -210,6 +243,11 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
                 f"scale={out_width}:{out_height},setsar=1,fps={fps},"
                 f"format=yuva420p[{label}]"
             )
+            clip_filters = video_effect_filters(clip, sequence, filter_seconds, uri_by_id)
+            if clip_filters:
+                filtered = label + "fx"
+                graph.append(f"[{label}]" + ",".join(clip_filters) + f"[{filtered}]")
+                label = filtered
             fade = _effect(clip, "crossfade")
             if fade is not None:
                 seconds = filter_seconds(fade.parameters["duration_frames"])
@@ -237,11 +275,17 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             start_sample = sample_index(clip.source_in_frame)
             end_sample = sample_index(clip.source_in_frame + clip.duration_frames)
             delay = sample_index(clip.start_frame)
-            volume = _effect(clip, "volume")
-            gain = _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0) if volume else 1.0
+            gain, muted, fade_in, fade_out = audio_effect_values(clip, track.effects)
+            audio_filters = [f"volume={gain:g}"]
+            if fade_in:
+                audio_filters.append(f"afade=t=in:st=0:d={filter_seconds(fade_in)}")
+            if fade_out:
+                fade_start = filter_seconds(clip.duration_frames - fade_out)
+                audio_filters.append(f"afade=t=out:st={fade_start}:d={filter_seconds(fade_out)}")
+            audio_filters.extend(["alimiter=limit=0.95", f"adelay={delay}S|{delay}S"])
             graph.append(
                 f"[{indexes[clip.asset_id]}:a]aresample=48000,atrim=start_sample={start_sample}:"
-                f"end_sample={end_sample},asetpts=N/SR/TB,volume={gain:g},adelay={delay}S|{delay}S,"
+                f"end_sample={end_sample},asetpts=N/SR/TB,{','.join(audio_filters)},"
                 f"apad,atrim=end_sample={sample_index(duration_frames)},"
                 f"asetpts=N/SR/TB[{label}]"
             )
@@ -250,6 +294,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
     if audio_labels:
         graph.append("".join(f"[{label}]" for label in audio_labels) +
                      f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
+                     "alimiter=limit=0.95,"
                      f"atrim=end_sample={sample_index(duration_frames)},"
                      "asetpts=N/SR/TB[aout]")
     else:
@@ -264,6 +309,11 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
 def compile_timeline(project: Project) -> dict[str, Any]:
     """Compile the explicitly supported two-video/two-audio demo topology."""
     project.validate()
+    p2c_effects = {"color", "crop", "title", "subtitle", "mute", "fade"}
+    if (any(track.effects for sequence in project.sequences for track in sequence.tracks)
+            or any(effect.kind in p2c_effects for sequence in project.sequences
+                   for track in sequence.tracks for clip in track.clips for effect in clip.effects)):
+        return _compile_extensible_timeline(project)
     if len(project.sequences) == 1:
         tracks = project.sequences[0].tracks
         if len(tracks) != 4 or [track.kind for track in tracks] != ["video", "video", "audio", "audio"] or [len(track.clips) for track in tracks] != [2, 1, 1, 1]:
@@ -469,7 +519,8 @@ def generate_sources(root: str | Path, ffmpeg: str = "ffmpeg") -> dict[str, Path
 
 def _run_checked(command: list[str], timeout: float | None, operation: str) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"{operation} timed out") from exc
     if result.returncode != 0:
@@ -554,7 +605,8 @@ def render_project(
     before_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=timeout, check=False, cwd=root_path)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("FFmpeg render timed out") from exc
     wall_seconds = time.monotonic() - started

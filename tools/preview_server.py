@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cloud_video_studio.assets import AssetStore
-from cloud_video_studio.project import Project
+from cloud_video_studio.project import Effect, Project
 from cloud_video_studio.timeline_edits import (
     add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
 )
@@ -297,6 +297,35 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('kind and track_id must be strings')
                     project = decode_project(data['project'])
                     edited = add_track(project, data['kind'], data['track_id'])
+                elif operation == 'effects':
+                    if set(data) not in (
+                        {'project', 'operation', 'clip_id', 'effects'},
+                        {'project', 'operation', 'clip_id', 'effects', 'scope'},
+                    ):
+                        raise ValueError('invalid effects fields')
+                    if not isinstance(data['clip_id'], str) or not isinstance(data['effects'], list) or len(data['effects']) > 8:
+                        raise ValueError('effects must be a bounded list for one clip')
+                    scope = data.get('scope', 'clip')
+                    if scope not in {'clip', 'track'}:
+                        raise ValueError('effect scope must be clip or track')
+                    project = Project.from_dict(data['project'])
+                    matches = [(track, clip) for sequence in project.sequences for track in sequence.tracks
+                               for clip in track.clips if clip.id == data['clip_id']]
+                    if len(matches) != 1:
+                        raise ValueError('unknown clip')
+                    track, clip = matches[0]
+                    effects = [Effect(**item) for item in data['effects']]
+                    if scope == 'track':
+                        if track.kind != 'audio':
+                            raise ValueError('track-level post-production is supported for audio tracks')
+                        if any(effect.kind not in {'volume', 'mute', 'fade'} for effect in effects):
+                            raise ValueError('audio tracks support volume, mute and fade')
+                        track.effects = effects
+                    else:
+                        clip.effects = effects
+                    if project.schema_version == 1:
+                        project.upgrade_asset_metadata()
+                    edited = project
                 elif operation == 'reorder':
                     if set(data) not in (
                         {'project', 'operation', 'clip_id'},
