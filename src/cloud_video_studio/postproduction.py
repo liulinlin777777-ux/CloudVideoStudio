@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import re
 from typing import Any
 
@@ -26,8 +27,21 @@ def integer(value: Any, name: str, low: int, high: int) -> int:
 def safe_text(value: Any) -> str:
     if not isinstance(value, str) or not value or len(value) > 256 or any(ord(ch) < 32 for ch in value):
         raise ValueError("title text must be 1-256 printable characters")
-    # drawtext's filter-argument parser treats these characters specially.
-    return re.sub(r"([\\:'%\[\],;=])", r"\\\1", value)
+    return value
+
+
+def title_file_token(clip: Clip) -> str:
+    """Return a stable, path-safe token for a renderer-owned UTF-8 text file."""
+    digest = hashlib.sha256(clip.id.encode("utf-8")).hexdigest()[:24]
+    return f"__CVS_TITLE_{digest}__"
+
+
+def font_alias(value: Any) -> str:
+    """Allow only portable fontconfig family aliases, never user paths."""
+    aliases = {"Sans": "Sans", "Serif": "Serif", "Monospace": "Monospace"}
+    if not isinstance(value, str) or value not in aliases:
+        raise ValueError("font family must be Sans, Serif or Monospace")
+    return aliases[value]
 
 
 def safe_srt_uri(value: Any) -> str:
@@ -67,9 +81,10 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
             filters.append(f"crop={width}:{height}:{x}:{y},scale={sequence.width}:{sequence.height}")
         elif effect.kind == 'title':
             required = {'text', 'x', 'y', 'font_size', 'color', 'start_frame', 'duration_frames'}
-            if set(p) != required:
+            if set(p) not in (required, required | {'font_family'}):
                 raise ValueError("title requires text, position, size, color and frame duration")
-            text = safe_text(p['text'])
+            safe_text(p['text'])
+            family = font_alias(p.get('font_family', 'Sans'))
             x = integer(p['x'], 'title x', 0, sequence.width - 1)
             y = integer(p['y'], 'title y', 0, sequence.height - 1)
             size = integer(p['font_size'], 'title font_size', 8, 96)
@@ -81,9 +96,9 @@ def video_effect_filters(clip: Clip, sequence: Sequence, frame_time, asset_uris:
             begin = frame_time(clip.start_frame + start)
             end = frame_time(clip.start_frame + start + duration)
             filters.append(
-                f"drawtext=font='Sans':text='{text}':expansion=none:x={x}:y={y}:"
+                f"drawtext=font='{family}':textfile='{title_file_token(clip)}':expansion=none:x={x}:y={y}:"
                 f"fontsize={size}:fontcolor={color}"
-                f":enable='between(t\\,{begin}\\,{end})'"
+                f":enable='gte(t\\,{begin})*lt(t\\,{end})'"
             )
         elif effect.kind == 'subtitle':
             required = {'asset_id', 'start_frame', 'duration_frames', 'position', 'font_size', 'color'}

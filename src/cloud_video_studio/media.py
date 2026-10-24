@@ -10,11 +10,12 @@ from pathlib import Path
 import re
 import resource
 import subprocess
+import tempfile
 import time
 from typing import Any
 
 from .project import Asset, Clip, Effect, Project, Sequence, Track
-from .postproduction import audio_effect_values, video_effect_filters
+from .postproduction import audio_effect_values, safe_text, title_file_token, video_effect_filters
 
 
 def make_demo_project() -> Project:
@@ -176,7 +177,9 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             if len(kinds) != len(set(kinds)):
                 raise ValueError(f"clip {clip.id} has duplicate effects")
             for effect in clip.effects:
-                if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
+                allowed_parameters = expected.get(effect.kind)
+                if (allowed_parameters is None or set(effect.parameters) != allowed_parameters
+                        and not (effect.kind == "title" and set(effect.parameters) == allowed_parameters | {"font_family"})):
                     raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
                 if track.kind == "audio" and effect.kind not in {"volume", "mute", "fade", "normalize", "crossfade"}:
                     raise ValueError("audio tracks only support volume, mute and fades")
@@ -260,14 +263,15 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
                 subtitle_label = label + "subtitle"
                 graph.append(
                     f"color=c=black@0:s={sequence.width}x{sequence.height}:r={fps}:"
-                    f"d={filter_seconds(clip.duration_frames)},format=rgba,"
+                    f"d={filter_seconds(clip.duration_frames)},format=rgba,geq=r=0:g=0:b=0:a=0,"
+                    f"setpts=PTS-STARTPTS,{subtitle_filters[0]},"
                     f"setpts=PTS+{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
-                    f"trim=start={begin}:end={end},{subtitle_filters[0]}[{subtitle_label}]"
+                    f"trim=start={begin}:end={end}[{subtitle_label}]"
                 )
                 captioned = label + "captioned"
                 graph.append(
                     f"[{label}][{subtitle_label}]overlay=eof_action=pass:shortest=0:format=auto:"
-                    f"enable='between(t\\,{begin}\\,{end})'[{captioned}]"
+                    f"enable='gte(t\\,{begin})*lt(t\\,{end})'[{captioned}]"
                 )
                 label = captioned
             if pip is not None:
@@ -315,7 +319,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             if fade_out:
                 fade_start = filter_seconds(clip.duration_frames - fade_out)
                 audio_filters.append(f"afade=t=out:st={fade_start}:d={filter_seconds(fade_out)}")
-            audio_filters.extend(["alimiter=limit=0.95", f"adelay={delay}S|{delay}S"])
+            audio_filters.append(f"adelay={delay}S|{delay}S")
             graph.append(
                 f"[{indexes[clip.asset_id]}:a]aresample=48000,atrim=start_sample={start_sample}:"
                 f"end_sample={end_sample},asetpts=N/SR/TB,{','.join(audio_filters)},"
@@ -328,7 +332,7 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         graph.append("".join(f"[{label}]" for label in audio_labels) +
                      f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
                      + ("loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json," if normalize_audio else "") +
-                     "alimiter=limit=0.95,"
+                     "alimiter=limit=0.95:level=false,"
                      f"atrim=end_sample={sample_index(duration_frames)},"
                      "asetpts=N/SR/TB[aout]")
     else:
@@ -338,6 +342,10 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         "duration_frames": duration_frames, "fps": fps,
         "width": sequence.width, "height": sequence.height,
         "audio_normalization": normalize_audio,
+        "title_texts": {
+            title_file_token(clip): safe_text(effect.parameters["text"])
+            for clip in all_clips for effect in clip.effects if effect.kind == "title"
+        },
     }
 
 
@@ -580,6 +588,14 @@ def _inside_root(path: Path, root: Path, name: str) -> Path:
     return resolved
 
 
+def _filter_path(path: Path) -> str:
+    """Escape an owned file path for the quoted FFmpeg filter option."""
+    value = str(path)
+    for character in ("\\", "'", ":", ",", ";", "[", "]"):
+        value = value.replace(character, "\\" + character)
+    return value
+
+
 def render_project(
     project: Project,
     root: str | Path,
@@ -626,24 +642,54 @@ def render_project(
         raise FileExistsError("render output already exists")
 
     hashes_before = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
-    command = [ffmpeg, "-nostdin", "-n"]
-    for asset_id in compiled["inputs"]:
-        command.extend(["-i", str(source_paths[asset_id])])
-    command.extend([
-        "-filter_complex_threads", "1", "-filter_complex", compiled["filtergraph"],
-        "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
-        "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart", str(target),
-    ])
     before_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
-    try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                timeout=timeout, check=False, cwd=root_path)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("FFmpeg render timed out") from exc
+    with tempfile.TemporaryDirectory(prefix=".cvs-title-", dir=root_path) as title_directory:
+        graph = compiled["filtergraph"]
+        for index, (token, text) in enumerate(compiled.get("title_texts", {}).items()):
+            text_path = Path(title_directory) / f"title-{index:02d}.txt"
+            text_path.write_text(text, encoding="utf-8", newline="")
+            graph = graph.replace(token, _filter_path(text_path))
+        if "__CVS_TITLE_" in graph:
+            raise ValueError("title text file token was not staged")
+
+        inputs = [item for asset_id in compiled["inputs"] for item in ("-i", str(source_paths[asset_id]))]
+        qa_command = [
+            ffmpeg, "-nostdin", "-n", *inputs,
+            "-filter_complex_threads", "1", "-filter_complex", graph,
+            "-map", "[vout]", "-map", "[aout]", "-af", "astats=metadata=0:reset=0",
+            "-f", "null", "-",
+        ]
+        try:
+            qa_result = subprocess.run(
+                qa_command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=min(float(timeout), 45.0), check=False, cwd=root_path,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("pre-export audio QA timed out") from exc
+        if qa_result.returncode != 0:
+            raise RuntimeError(f"pre-export audio QA failed: {qa_result.stderr.strip()}")
+        measurements: dict[str, float] = {}
+        for key, label in (("peak_level_db", "Peak level dB"), ("rms_level_db", "RMS level dB")):
+            values = re.findall(rf"{label}:\s*(-?inf|[-+]?\d+(?:\.\d+)?)", qa_result.stderr)
+            if not values:
+                raise RuntimeError(f"pre-export audio QA did not report {label}")
+            value = values[-1]
+            measurements[key] = float("-inf") if value == "-inf" else float(value)
+
+        command = [
+            ffmpeg, "-nostdin", "-n", *inputs,
+            "-filter_complex_threads", "1", "-filter_complex", graph,
+            "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
+            "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-movflags", "+faststart", str(target),
+        ]
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=timeout, check=False, cwd=root_path)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("FFmpeg render timed out") from exc
     wall_seconds = time.monotonic() - started
     after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     if result.returncode != 0:
@@ -672,4 +718,5 @@ def render_project(
         "source_hashes_before": hashes_before,
         "source_hashes_after": hashes_after,
         "audio_loudness": loudness,
+        "audio_qa": measurements,
     }

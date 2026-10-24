@@ -143,11 +143,14 @@ class IndependentRegressionTests(unittest.TestCase):
             'text': "x';movie=bad", 'x': 0, 'y': 0, 'font_size': 24,
             'color': '#ffffff', 'start_frame': 0, 'duration_frames': 10,
         }))
-        graph = compile_timeline(project)['filtergraph']
-        self.assertIn(r"x\'\;movie\=bad", graph)
+        compiled = compile_timeline(project)
+        graph = compiled['filtergraph']
+        self.assertNotIn("movie=bad", graph)
+        self.assertIn("x';movie=bad", compiled['title_texts'].values())
+        self.assertIn("textfile='__CVS_TITLE_", graph)
         self.assertIn('expansion=none', graph)
         self.assertIn("font='Sans'", graph)
-        self.assertIn(r"enable='between(t\,0\,0.333667)'", graph)
+        self.assertIn(r"enable='gte(t\,0)*lt(t\,0.333667)'", graph)
         project.sequences[0].tracks[0].clips[0].effects[0].parameters['font_size'] = 1000
         with self.assertRaises(ValueError):
             compile_timeline(project)
@@ -160,11 +163,26 @@ class IndependentRegressionTests(unittest.TestCase):
             'asset_id': 'captions', 'start_frame': 5, 'duration_frames': 20,
             'position': 'bottom', 'font_size': 24, 'color': '#ffffff',
         }))
-        graph = compile_timeline(project)['filtergraph']
+        compiled = compile_timeline(project)
+        graph = compiled['filtergraph']
         self.assertIn('subtitles=filename=', graph)
         self.assertNotIn("MarginV=24':enable=", graph)
         self.assertIn('color=c=black@0', graph)
+        self.assertIn('format=rgba,geq=r=0:g=0:b=0:a=0', graph)
+        self.assertIn('setpts=PTS-STARTPTS', graph)
+        self.assertIn(r'gte(t\,0.166833)*lt(t\,0.834167)', graph)
         self.assertIn("overlay=eof_action=pass:shortest=0:format=auto:enable=", graph)
+
+    def test_title_font_uses_safe_alias(self):
+        project = make_demo_project()
+        project.sequences[0].tracks[0].clips[0].effects.append(Effect('title', {
+            'text': 'Safe title', 'font_family': 'Monospace', 'x': 0, 'y': 0,
+            'font_size': 24, 'color': '#ffffff', 'start_frame': 0, 'duration_frames': 10,
+        }))
+        self.assertIn("font='Monospace'", compile_timeline(project)['filtergraph'])
+        project.sequences[0].tracks[0].clips[0].effects[0].parameters['font_family'] = '../../etc/passwd'
+        with self.assertRaises(ValueError):
+            compile_timeline(project)
 
     def test_crop_and_pip_compose_and_loudness_is_measured_when_requested(self):
         project = make_demo_project()

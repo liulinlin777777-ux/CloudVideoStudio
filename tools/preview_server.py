@@ -364,6 +364,7 @@ class Handler(BaseHTTPRequestHandler):
                     'output_bytes': receipt['output_bytes'], 'fps': compiled['fps'],
                     'duration_frames': compiled['duration_frames'],
                     'audio_loudness': receipt['audio_loudness'],
+                    'audio_qa': receipt['audio_qa'],
                 })
             finally:
                 lock.release()
