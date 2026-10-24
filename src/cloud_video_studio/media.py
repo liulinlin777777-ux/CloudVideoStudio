@@ -662,6 +662,32 @@ def _complete_audio_qa(measurements, project, compiled):
     return qa
 
 
+def _title_font_family(family: str, text: str) -> str:
+    """Resolve CJK glyph coverage with installed fontconfig, never user paths."""
+    if not any(0x3400 <= ord(char) <= 0x9fff or 0xf900 <= ord(char) <= 0xfaff for char in text):
+        return family
+    alias = "Sans" if family == "Monospace" else family
+    try:
+        match = subprocess.run(["fc-match", "-f", "%{family}\n%{charset}", "--", alias + ":lang=zh-cn"],
+                               capture_output=True, text=True, timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("CJK titles require installed fontconfig and a CJK font") from error
+    lines = match.stdout.splitlines()
+    resolved = lines[0].split(",")[0] if len(lines) >= 2 else ""
+    if not re.fullmatch(r"[A-Za-z0-9 ._-]{1,80}", resolved):
+        raise ValueError("No safe installed CJK font family was resolved")
+    coverage = []
+    try:
+        for part in lines[1].split():
+            ends = part.split("-")
+            coverage.append((int(ends[0],16),int(ends[-1],16)))
+    except ValueError as error:
+        raise ValueError("Installed font coverage could not be verified") from error
+    if any(not char.isspace() and not any(a <= ord(char) <= b for a,b in coverage) for char in text):
+        raise ValueError("The installed font lacks title glyphs; install a suitable CJK font locally")
+    return resolved
+
+
 def render_project(
     project: Project,
     root: str | Path,
@@ -713,6 +739,12 @@ def render_project(
     with tempfile.TemporaryDirectory(prefix=".cvs-title-", dir=root_path) as title_directory:
         graph = compiled["filtergraph"]
         for index, (token, text) in enumerate(compiled.get("title_texts", {}).items()):
+            font_match = re.search(r"drawtext=font='(Sans|Serif|Monospace)':textfile='" + re.escape(token) + "'", graph)
+            if not font_match:
+                raise ValueError("Title font binding is invalid")
+            family = font_match.group(1)
+            resolved = _title_font_family(family, text)
+            graph = graph.replace(f"font='{family}':textfile='{token}'", f"font='{resolved}':textfile='{token}'", 1)
             text_path = Path(title_directory) / f"title-{index:02d}.txt"
             text_path.write_text(text, encoding="utf-8", newline="")
             graph = graph.replace(token, _filter_path(text_path.relative_to(root_path)))

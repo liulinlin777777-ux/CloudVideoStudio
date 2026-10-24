@@ -259,3 +259,25 @@ class IndependentRegressionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FontCoverageRegression(unittest.TestCase):
+    def test_latin_alias_needs_no_fontconfig_probe(self):
+        from cloud_video_studio.media import _title_font_family
+        from unittest.mock import patch
+        with patch("cloud_video_studio.media.subprocess.run") as run:
+            self.assertEqual(_title_font_family("Serif", "Literal title [] %"), "Serif")
+            run.assert_not_called()
+    def test_missing_cjk_glyphs_are_rejected(self):
+        from cloud_video_studio.media import _title_font_family
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with patch("cloud_video_studio.media.subprocess.run", return_value=SimpleNamespace(stdout="DejaVu Sans\n20-7e")):
+            with self.assertRaisesRegex(ValueError,"lacks title glyphs"):
+                _title_font_family("Sans", "中文")
+    def test_installed_cjk_family_is_coverage_checked(self):
+        from cloud_video_studio.media import _title_font_family
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with patch("cloud_video_studio.media.subprocess.run", return_value=SimpleNamespace(stdout="Noto Sans CJK SC\n20-7e 4e00-9fff")):
+            self.assertEqual(_title_font_family("Sans", "中文 title"),"Noto Sans CJK SC")
