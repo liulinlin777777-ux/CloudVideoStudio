@@ -1,10 +1,13 @@
 import unittest
 import tempfile
 import subprocess
+import json
 from pathlib import Path
 from unittest.mock import patch
 
-from cloud_video_studio.media import make_demo_project, compile_timeline, render_project
+from cloud_video_studio.media import (
+    make_demo_project, compile_timeline, render_project, _audio_qa_graph, _parse_audio_qa,
+)
 from cloud_video_studio.plugins import run_plugin, PluginError, PLUGIN
 from cloud_video_studio.project import Asset, Effect
 
@@ -168,9 +171,10 @@ class IndependentRegressionTests(unittest.TestCase):
         self.assertIn('subtitles=filename=', graph)
         self.assertNotIn("MarginV=24':enable=", graph)
         self.assertIn('color=c=black@0', graph)
-        self.assertIn('format=rgba,geq=r=0:g=0:b=0:a=0', graph)
+        self.assertIn('format=yuva420p,geq=r=0:g=0:b=0:a=0', graph)
         self.assertIn('setpts=PTS-STARTPTS', graph)
-        self.assertIn(r'gte(t\,0.166833)*lt(t\,0.834167)', graph)
+        self.assertIn('trim=start=0.166833:end=0.834167', graph)
+        self.assertIn('setpts=PTS+0*1001/30000/TB', graph)
         self.assertIn("overlay=eof_action=pass:shortest=0:format=auto:enable=", graph)
 
     def test_title_font_uses_safe_alias(self):
@@ -194,6 +198,49 @@ class IndependentRegressionTests(unittest.TestCase):
         self.assertIn('scale=160:90', compiled['filtergraph'])
         self.assertIn('loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json', compiled['filtergraph'])
         self.assertTrue(compiled['audio_normalization'])
+        self.assertIn('loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json,aresample=48000', compiled['filtergraph'])
+
+    def test_pre_export_audio_qa_uses_complex_graph_and_strict_silence_json(self):
+        qa_graph = _audio_qa_graph('color=s=2x2[vout];anullsrc[aout]')
+        self.assertTrue(qa_graph.endswith('[aout];[aout]astats=metadata=0:reset=0[aqa]'))
+        self.assertEqual(_parse_audio_qa('Peak level dB: -inf\nRMS level dB: -inf'), {
+            'peak_level_db': None, 'rms_level_db': None,
+        })
+        self.assertEqual(json.dumps(_parse_audio_qa('Peak level dB: -inf\nRMS level dB: -inf'), allow_nan=False),
+                         '{"peak_level_db": null, "rms_level_db": null}')
+        self.assertEqual(_parse_audio_qa('Peak level dB: -3.25\nRMS level dB: -12.5'), {
+            'peak_level_db': -3.25, 'rms_level_db': -12.5,
+        })
+
+    def test_title_frame_span_is_clip_local_at_nonzero_timeline_offset(self):
+        project = make_demo_project()
+        # Use the independent overlay clip so shifting it does not invalidate
+        # the primary track's crossfade fixture.
+        clip = project.sequences[0].tracks[1].clips[0]
+        clip.start_frame = 45
+        clip.effects.append(Effect('title', {
+            'text': 'Local span', 'x': 10, 'y': 10, 'font_size': 24,
+            'color': '#ffffff', 'start_frame': 5, 'duration_frames': 20,
+        }))
+        graph = compile_timeline(project)['filtergraph']
+        self.assertIn(r"enable='gte(t-1.5015\,0.166833)*lt(t-1.5015\,0.834167)'", graph)
+
+    def test_subtitle_frame_span_and_top_placement_are_clip_local(self):
+        project = make_demo_project()
+        project.assets.append(Asset('captions', 'assets/files/0123456789abcdef0123456789abcdef.srt', 150,
+                                  {'version': 2, 'kind': 'subtitle'}))
+        # Use the independent overlay clip so shifting it does not invalidate
+        # the primary track's crossfade fixture.
+        clip = project.sequences[0].tracks[1].clips[0]
+        clip.start_frame = 45
+        clip.effects.append(Effect('subtitle', {
+            'asset_id': 'captions', 'start_frame': 5, 'duration_frames': 20,
+            'position': 'top', 'font_size': 24, 'color': '#ffffff',
+        }))
+        graph = compile_timeline(project)['filtergraph']
+        self.assertIn('Alignment=8,MarginV=24', graph)
+        self.assertIn('trim=start=0.166833:end=0.834167', graph)
+        self.assertIn('setpts=PTS+45*1001/30000/TB', graph)
 
     def test_audio_track_treatment_is_versioned_and_applies_to_all_clips(self):
         project = make_demo_project()
