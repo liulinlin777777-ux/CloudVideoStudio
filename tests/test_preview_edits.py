@@ -78,9 +78,14 @@ class PreviewContract(unittest.TestCase):
   self.assertEqual(b['project']['sequences'][0]['fps_num'],25)
 
  def test_media_search_and_analysis_routes_keep_loopback_and_asset_scope(self):
-  code,body=self.request('/assets/search?q=clip')
+  self.assertEqual(self.request('/assets/search?q=clip')[0],404)
+  self.assertEqual(self.request('/assets/search',{'q':'clip'})[0],403)
+  self.assertEqual(self.request('/assets/search',{'q':'clip'},origin='https://evil.example')[0],403)
+  same_origin=f'http://127.0.0.1:{self.port}'
+  code,body=self.request('/assets/search',{'q':'clip'},origin=same_origin)
   self.assertEqual(code,200,body);self.assertEqual(body,{'assets':[]})
-  self.assertEqual(self.request('/assets/search?q='+('x'*121))[0],400)
+  self.assertEqual(self.request('/assets/search',{'q':'x'*121},origin=same_origin)[0],400)
+  self.assertEqual(self.request('/assets/search',{'q':'clip','extra':True},origin=same_origin)[0],400)
   from unittest.mock import patch
   asset_id='a'*32
   body={'scene_threshold':0.35,'max_scenes':24}

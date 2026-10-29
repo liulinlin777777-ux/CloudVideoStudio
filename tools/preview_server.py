@@ -139,12 +139,6 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/assets':
                 with asset_lock:
                     return self.reply(200, {'schema_version': 2, 'assets': asset_store.list_assets()})
-            if route == '/assets/search':
-                values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
-                if set(values) - {'q'} or len(values.get('q', [''])) != 1:
-                    return self.reply(400, {'error': 'INVALID_SEARCH_QUERY'})
-                with asset_lock:
-                    return self.reply(200, {'assets': search_assets(asset_store, values.get('q', [''])[0])})
             analysis_match = re.fullmatch(r'/assets/([0-9a-f]{32})/analysis', route)
             if analysis_match:
                 with asset_lock:
@@ -251,6 +245,8 @@ class Handler(BaseHTTPRequestHandler):
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
                 upload_slots.release()
+        if self.path == '/assets/search' and not self.browser_origin():
+            return self.reply(403, {'error': 'ORIGIN_DENIED'})
         try:
             data = self.read_json()
         except OverflowError:
@@ -258,6 +254,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             return self.reply(400, {'error': type(error).__name__})
         try:
+            if self.path == '/assets/search':
+                if not isinstance(data, dict) or set(data) != {'q'} or not isinstance(data['q'], str):
+                    raise ValueError('invalid asset search fields')
+                with asset_lock:
+                    return self.reply(200, {'assets': search_assets(asset_store, data['q'])})
             analysis_match = re.fullmatch(r'/assets/([0-9a-f]{32})/analyze', self.path)
             if analysis_match:
                 if not self.browser_origin():
