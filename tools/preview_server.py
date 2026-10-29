@@ -12,6 +12,9 @@ from pathlib import Path
 
 from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.project import Project
+from cloud_video_studio.creative_brief import (
+    MAX_ARTIFACT_BYTES, BriefRevisionConflict, artifact_path, artifact_sha256, read_brief, save_brief,
+)
 from cloud_video_studio.timeline_edits import (
     add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
 )
@@ -27,6 +30,7 @@ html = Path(__file__).resolve().parents[1] / 'web/index.html'
 lock = threading.Lock()
 asset_lock = threading.RLock()
 MAX_BODY = 65536
+MAX_BRIEF_BODY = MAX_ARTIFACT_BYTES + 4096
 MAX_UPLOAD = 512 * 1024 * 1024
 upload_slots = threading.BoundedSemaphore(2)
 asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024)
@@ -130,6 +134,10 @@ class Handler(BaseHTTPRequestHandler):
                 project = current()
                 compile_timeline(project)
                 return self.reply(200, project.to_dict())
+            if self.path == '/creative-brief':
+                project = current()
+                brief = read_brief(artifact_path(root, project.id), project.id)
+                return self.reply(200, {'brief': brief, 'sha256': artifact_sha256(brief)})
             if self.path == '/assets':
                 with asset_lock:
                     return self.reply(200, {'schema_version': 2, 'assets': asset_store.list_assets()})
@@ -155,12 +163,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             return self.reply(400, {'error': type(error).__name__})
 
-    def read_json(self):
+    def read_json(self, max_bytes=MAX_BODY):
         try:
             length = int(self.headers.get('Content-Length', '0'))
         except (TypeError, ValueError):
             raise ValueError('invalid content length')
-        if not 0 < length <= MAX_BODY:
+        if not 0 < length <= max_bytes:
             raise OverflowError('body size')
         raw = self.rfile.read(length)
         if len(raw) != length:
@@ -227,12 +235,34 @@ class Handler(BaseHTTPRequestHandler):
                     temporary.unlink(missing_ok=True)
                 upload_slots.release()
         try:
-            data = self.read_json()
+            data = self.read_json(MAX_BRIEF_BODY if self.path == '/creative-brief' else MAX_BODY)
         except OverflowError:
             return self.reply(413, {'error': 'BODY_SIZE'})
         except Exception as error:
             return self.reply(400, {'error': type(error).__name__})
         try:
+            if self.path == '/creative-brief':
+                if not self.browser_origin():
+                    return self.reply(403, {'error': 'ORIGIN_DENIED'})
+                if not isinstance(data, dict) or set(data) != {'action', 'brief', 'expected_sha256'}:
+                    raise ValueError('invalid creative brief request')
+                if data['action'] not in {'save', 'approve'}:
+                    raise ValueError('unknown creative brief action')
+                if (not isinstance(data['expected_sha256'], str)
+                        or not re.fullmatch(r'[0-9a-f]{64}', data['expected_sha256'])):
+                    raise ValueError('invalid expected brief revision')
+                project = current()
+                try:
+                    brief = save_brief(
+                        artifact_path(root, project.id), data['brief'], project.id,
+                        approve=data['action'] == 'approve', expected_sha256=data['expected_sha256'],
+                    )
+                except BriefRevisionConflict as error:
+                    return self.reply(409, {
+                        'error': 'BRIEF_REVISION_CONFLICT', 'current_sha256': error.current_sha256,
+                    })
+                return self.reply(200, {'status': 'approved' if data['action'] == 'approve' else 'saved',
+                                        'brief': brief, 'sha256': artifact_sha256(brief)})
             if self.path == '/edit':
                 if not isinstance(data, dict):
                     raise ValueError('request must be an object')
@@ -338,6 +368,8 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 lock.release()
         except Exception as error:
+            if self.path == '/creative-brief' and isinstance(error, ValueError):
+                return self.reply(400, {'error': str(error)[:240]})
             return self.reply(400, {'error': type(error).__name__})
 
 
