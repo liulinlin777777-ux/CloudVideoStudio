@@ -86,6 +86,7 @@ class PreviewContract(unittest.TestCase):
   body={'scene_threshold':0.35,'max_scenes':24}
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin='https://evil.example')[0],403)
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin=f'http://127.0.0.1:{self.port}')[0],400)
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',{'force':1},origin=f'http://127.0.0.1:{self.port}')[0],400)
   self.assertIn(self.request(f'/assets/{asset_id}/keyframes/0')[0],[400,404])
   self.assertEqual(self.request(f'/assets/{asset_id}/keyframes/0?analysis_id=not-a-version')[0],400)
   with patch.dict(self.handler.do_GET.__globals__, {'read_keyframe': lambda store, requested_id, index, *, analysis_id:
@@ -99,8 +100,9 @@ class PreviewContract(unittest.TestCase):
   def fake_analyze(asset_id,**kwargs):
    self.assertFalse(lock._is_owned())
    self.assertIs(kwargs['publication_lock'],lock)
+   self.assertIs(kwargs['force'],True)
    return {'keyframes':[],'scenes':[],'scene_detection':{'candidate_count':0}}
   with patch.object(analyzer,'analyze',side_effect=fake_analyze):
-   code,body=self.request('/assets/'+('a'*32)+'/analyze',{'scene_threshold':0.35},
+   code,body=self.request('/assets/'+('a'*32)+'/analyze',{'scene_threshold':0.35,'force':True},
                           origin=f'http://127.0.0.1:{self.port}')
   self.assertEqual(code,200,body)

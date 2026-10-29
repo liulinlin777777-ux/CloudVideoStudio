@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from .assets import AssetStore
 
@@ -48,6 +48,7 @@ class _OutputLimitExceeded(Exception):
 
 def _bounded_subprocess(
     command: list[str], *, timeout: float, stdout_limit: int, stderr_limit: int,
+    output_watch: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Capture bounded child output and terminate the child as soon as it overflows."""
     started = time.monotonic()
@@ -62,12 +63,23 @@ def _bounded_subprocess(
     exceeded: str | None = None
     exceeded_at: float | None = None
     timed_out = False
+    watch_error: Exception | None = None
     streams = {"stdout": process.stdout, "stderr": process.stderr}
     try:
         for name, stream in streams.items():
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
         while selector.get_map() or process.poll() is None:
+            if output_watch is not None and watch_error is None:
+                try:
+                    output_watch()
+                except Exception as error:
+                    watch_error = error
+                    exceeded_at = time.monotonic()
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0 and not timed_out and process.poll() is None:
                 timed_out = True
@@ -116,6 +128,13 @@ def _bounded_subprocess(
             except ProcessLookupError:
                 pass
             process.wait()
+    if output_watch is not None and watch_error is None:
+        try:
+            output_watch()
+        except Exception as error:
+            watch_error = error
+    if watch_error is not None:
+        raise watch_error
     if timed_out:
         raise subprocess.TimeoutExpired(command, timeout)
     if exceeded is not None:
@@ -129,6 +148,22 @@ def _bounded_subprocess(
 
 class MediaAnalysisError(ValueError):
     """A bounded media analysis failed or its result was invalid."""
+
+
+def _check_directory_output_limit(directory: Path, limit: int) -> int:
+    """Reject temporary media output as soon as its aggregate bytes exceed a bound."""
+    total = 0
+    try:
+        for path in directory.iterdir():
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise MediaAnalysisError("analysis temporary output is invalid")
+            total += info.st_size
+            if total > limit:
+                raise MediaAnalysisError("analysis keyframes exceeded their total size limit")
+    except OSError as exc:
+        raise MediaAnalysisError("analysis temporary output is unavailable") from exc
+    return total
 
 
 def _cache_payload(data: dict[str, Any]) -> bytes:
@@ -528,10 +563,13 @@ class MediaIntelligence:
         *,
         scene_threshold: float = 0.35,
         max_scenes: int = _SCENE_COUNT_LIMIT,
+        force: bool = False,
         publication_lock: Any = None,
     ) -> dict[str, Any]:
         if not _ASSET_ID.fullmatch(asset_id):
             raise MediaAnalysisError("invalid asset id")
+        if not isinstance(force, bool):
+            raise MediaAnalysisError("force must be a boolean")
         if (isinstance(scene_threshold, bool) or not isinstance(scene_threshold, (int, float))
                 or not math.isfinite(scene_threshold) or not 0.05 <= scene_threshold <= 0.95):
             raise MediaAnalysisError("scene threshold must be between 0.05 and 0.95")
@@ -542,7 +580,7 @@ class MediaIntelligence:
         with _analysis_store_lock(self.store, deadline):
             record, source, probe = self._verified_asset_under_store_lock(asset_id, deadline=deadline)
             cached = _load_analysis(self.store, asset_id, record)
-        if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
+        if (not force and cached and cached.get("scene_detection", {}).get("threshold") == threshold
                 and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
             publication = publication_lock if publication_lock is not None else self.store._lock
             with _lock_until(publication, deadline):
@@ -551,7 +589,7 @@ class MediaIntelligence:
                         asset_id, deadline=deadline,
                     )
                     cached = _load_analysis(self.store, asset_id, record)
-                    if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
+                    if (not force and cached and cached.get("scene_detection", {}).get("threshold") == threshold
                             and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
                         self._remaining(deadline)
                         return cached
@@ -596,7 +634,7 @@ class MediaIntelligence:
         directory = _derivatives_dir(self.store)
         new_keyframes: list[str] = []
         cache_committed = False
-        temporary_dir_context = tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=directory)
+        temporary_dir_context = tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=self.store.root)
         try:
             temporary_dir = temporary_dir_context.name
             pattern = str(Path(temporary_dir) / "frame-%03d.jpg")
@@ -614,7 +652,12 @@ class MediaIntelligence:
                 "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",
                 "-f", "image2", "-start_number", "0", pattern,
             ]
-            self._run(frame_cmd, "keyframe extraction", deadline=deadline)
+            self._run(
+                frame_cmd, "keyframe extraction", deadline=deadline,
+                output_watch=lambda: _check_directory_output_limit(
+                    Path(temporary_dir), _ANALYSIS_OUTPUT_LIMIT,
+                ),
+            )
             images = sorted(Path(temporary_dir).glob("frame-*.jpg"))
             if len(images) != output_count:
                 raise MediaAnalysisError("keyframe count did not match detected scene boundaries")
@@ -823,11 +866,19 @@ class MediaIntelligence:
             "tags": clean_tags,
         }
 
-    def _run(self, command: list[str], operation: str, *, deadline: float) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        command: list[str],
+        operation: str,
+        *,
+        deadline: float,
+        output_watch: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         try:
             result = _bounded_subprocess(
                 command, timeout=self._remaining(deadline),
                 stdout_limit=16 * 1024 * 1024, stderr_limit=1024 * 1024,
+                output_watch=output_watch,
             )
         except _OutputLimitExceeded as exc:
             raise MediaAnalysisError(f"{operation.upper().replace(' ', '_')}_OUTPUT_LIMIT") from exc

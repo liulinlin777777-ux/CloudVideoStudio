@@ -23,7 +23,11 @@ metadata, and is ignored when a relink changes the bytes or display name.
 Analysis revalidates the asset under the store's cross-process lock before
 returning a cache hit and holds that lock while replacing keyframes and cache.
 Keyframe reads resolve through the validated per-asset analysis index, not a
-browser-provided path.
+browser-provided path. Frames are staged outside the derivative directory and
+their aggregate temporary size is watched while FFmpeg runs; only validated
+frames that fit the derivative quota are committed. The browser renders asset
+rows before it loads saved analysis snapshots, and its re-analysis action
+forces a fresh scene pass instead of returning a matching cache entry.
 
 ## Limits and status
 

@@ -263,8 +263,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.browser_origin():
                     return self.reply(403, {'error': 'ORIGIN_DENIED'})
                 if (not isinstance(data, dict) or not data
-                        or set(data) - {'scene_threshold', 'max_scenes'}):
+                        or set(data) - {'scene_threshold', 'max_scenes', 'force'}):
                     raise ValueError('invalid media analysis fields')
+                force = data.get('force', False)
+                if not isinstance(force, bool):
+                    raise ValueError('force must be a boolean')
                 if not analysis_lock.acquire(blocking=False):
                     return self.reply(409, {'error': 'ANALYSIS_BUSY'})
                 try:
@@ -272,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
                         analysis_match.group(1),
                         scene_threshold=data.get('scene_threshold', 0.35),
                         max_scenes=data.get('max_scenes', 24),
+                        force=force,
                         publication_lock=asset_lock,
                     )
                     return self.reply(200, {key: value for key, value in result.items() if key != 'keyframes'})

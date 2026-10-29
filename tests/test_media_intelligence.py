@@ -101,6 +101,27 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertEqual(search_assets(self.store, str(self.asset["size_bytes"]))[0]["id"], self.asset["id"])
         self.assertEqual(search_assets(self.store, "h264")[0]["id"], self.asset["id"])
         self.assertEqual(search_assets(self.store, "not-present"), [])
+        refreshed = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=8, force=True)
+        self.assertNotEqual(refreshed["analysis_id"], result["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), refreshed)
+
+    def test_bounded_subprocess_stops_when_temporary_output_exceeds_its_limit(self):
+        output_dir = self.root / "bounded-output"
+        output_dir.mkdir()
+        output_file = output_dir / "frame.jpg"
+        command = [
+            sys.executable,
+            "-c",
+            "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_bytes(b'x'*1048576); time.sleep(5)",
+            str(output_file),
+        ]
+        started = time.monotonic()
+        with self.assertRaisesRegex(MediaAnalysisError, "total size limit"):
+            _bounded_subprocess(
+                command, timeout=10, stdout_limit=1024, stderr_limit=1024,
+                output_watch=lambda: media_module._check_directory_output_limit(output_dir, 1024),
+            )
+        self.assertLess(time.monotonic() - started, 2)
 
     def test_analysis_deadline_bounds_thread_lock_wait(self):
         analyzer = MediaIntelligence(self.store, timeout=0.05)
