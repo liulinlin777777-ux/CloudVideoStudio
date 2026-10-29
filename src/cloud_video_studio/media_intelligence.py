@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import tempfile
@@ -54,7 +55,7 @@ def _bounded_subprocess(
     started = time.monotonic()
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        bufsize=0,
+        bufsize=0, start_new_session=(os.name == "posix"),
     )
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
@@ -76,23 +77,13 @@ def _bounded_subprocess(
                 except Exception as error:
                     watch_error = error
                     exceeded_at = time.monotonic()
-                    try:
-                        process.terminate()
-                    except ProcessLookupError:
-                        pass
+                    _signal_subprocess_group(process, signal.SIGTERM)
             remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0 and not timed_out and process.poll() is None:
+            if remaining <= 0 and not timed_out:
                 timed_out = True
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if (exceeded_at is not None and process.poll() is None
-                    and time.monotonic() - exceeded_at >= 0.25):
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+                _signal_subprocess_group(process, signal.SIGKILL)
+            if exceeded_at is not None and time.monotonic() - exceeded_at >= 0.25:
+                _signal_subprocess_group(process, signal.SIGKILL)
             events = selector.select(max(0.0, min(0.05, remaining))) if selector.get_map() else []
             for key, _ in events:
                 stream = key.fileobj
@@ -112,10 +103,7 @@ def _bounded_subprocess(
                 if len(captured) > limits[name] and exceeded is None:
                     exceeded = name
                     exceeded_at = time.monotonic()
-                    try:
-                        process.terminate()
-                    except ProcessLookupError:
-                        pass
+                    _signal_subprocess_group(process, signal.SIGTERM)
         process.wait()
     finally:
         selector.close()
@@ -123,10 +111,7 @@ def _bounded_subprocess(
             if not stream.closed:
                 stream.close()
         if process.poll() is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+            _signal_subprocess_group(process, signal.SIGKILL)
             process.wait()
     if output_watch is not None and watch_error is None:
         try:
@@ -144,6 +129,17 @@ def _bounded_subprocess(
         buffers["stdout"].decode("utf-8", errors="replace"),
         buffers["stderr"].decode("utf-8", errors="replace"),
     )
+
+
+def _signal_subprocess_group(process: subprocess.Popen, signum: int) -> None:
+    """Stop the bounded subprocess and descendants that inherited its pipes."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signum)
+        elif process.poll() is None:
+            process.send_signal(signum)
+    except ProcessLookupError:
+        pass
 
 
 class MediaAnalysisError(ValueError):

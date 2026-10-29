@@ -405,6 +405,7 @@ class AssetStore:
             temporary = None
             assets[index] = record
             try:
+                self._remove_analysis_derivatives(asset_id)
                 self._write_manifest(assets)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -417,6 +418,31 @@ class AssetStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return dict(record)
+
+    def _remove_analysis_derivatives(self, asset_id: str) -> None:
+        """Discard cached analysis files before a relinked record is published."""
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise ValueError("invalid asset id")
+        directory = self.root / "derivatives"
+        try:
+            directory_info = directory.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise ValueError("asset derivative directory must be a real directory")
+        cache_name = f"{asset_id}-analysis.json"
+        keyframe_name = re.compile(
+            rf"{re.escape(asset_id)}-analysis-[0-9a-f]{{12}}-\d{{3}}\.jpg"
+        )
+        for derivative in directory.iterdir():
+            if derivative.name != cache_name and not keyframe_name.fullmatch(derivative.name):
+                continue
+            try:
+                info = derivative.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                derivative.unlink(missing_ok=True)
 
     def _source(self, path: str | Path) -> tuple[Path, int]:
         source = Path(path).expanduser().absolute()

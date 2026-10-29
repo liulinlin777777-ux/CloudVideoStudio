@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -272,6 +273,24 @@ class MediaIntelligenceTests(unittest.TestCase):
                 self.assertTrue(frame.startswith(b"\xff\xd8\xff"))
             self.assertEqual(hash_call.call_count, 1)
 
+    def test_same_byte_relink_discards_stale_analysis_cache_and_keyframes(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        directory = self.store.root / "derivatives"
+        cache = directory / f"{self.asset['id']}-analysis.json"
+        keyframes = [directory / name for name in result["keyframes"]]
+        self.assertTrue(cache.is_file())
+        self.assertTrue(all(path.is_file() for path in keyframes))
+
+        relinked = self.store.relink(
+            self.asset["id"], self.source, filename="renamed-same-byte-clip.mp4",
+        )
+
+        self.assertEqual(relinked["sha256"], self.asset["sha256"])
+        self.assertEqual(relinked["filename"], "renamed-same-byte-clip.mp4")
+        self.assertFalse(cache.exists())
+        self.assertTrue(all(not path.exists() for path in keyframes))
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+
     def test_analysis_deadline_is_created_before_managed_file_validation(self):
         captured = {}
 
@@ -320,6 +339,17 @@ class MediaIntelligenceTests(unittest.TestCase):
             command = [sys.executable, "-c", f"import os\nwhile True: os.write({fd}, b'x' * 65536)"]
             with self.subTest(channel=channel), self.assertRaisesRegex(_OutputLimitExceeded, channel):
                 _bounded_subprocess(command, timeout=5, stdout_limit=128, stderr_limit=128)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX process groups")
+    def test_subprocess_deadline_covers_pipes_held_by_forked_child(self):
+        command = [
+            sys.executable, "-c",
+            "import os,time; child=os.fork(); os._exit(0) if child else time.sleep(2)",
+        ]
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _bounded_subprocess(command, timeout=0.1, stdout_limit=1024, stderr_limit=1024)
+        self.assertLess(time.monotonic() - started, 1.5)
 
     def test_analysis_duration_bounds_both_ffmpeg_input_passes(self):
         with patch.object(media_module, "_ANALYSIS_SECONDS_LIMIT", 1.5), \
