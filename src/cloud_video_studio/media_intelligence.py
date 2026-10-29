@@ -640,6 +640,7 @@ class MediaIntelligence:
         directory = _derivatives_dir(self.store)
         new_keyframes: list[str] = []
         cache_committed = False
+        cache_written = False
         temporary_dir_context = tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=self.store.root)
         try:
             temporary_dir = temporary_dir_context.name
@@ -749,13 +750,29 @@ class MediaIntelligence:
                         new_keyframes.append(name)
                     self._remaining(deadline)
                     self._write_cache(asset_id, result)
-                    cache_committed = True
+                    cache_written = True
                     self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
+                    self.store._check_derivative_total()
+                    cache_committed = True
             return result
-        except BaseException:
+        except BaseException as failure:
             if not cache_committed:
+                if cache_written:
+                    try:
+                        _cache_path(self.store, asset_id).unlink(missing_ok=True)
+                    except (OSError, ValueError):
+                        pass
                 for name in new_keyframes:
-                    (directory / name).unlink(missing_ok=True)
+                    try:
+                        (directory / name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
+                    self.store._check_derivative_total()
+                except ValueError as quota_error:
+                    raise MediaAnalysisError(
+                        "analysis failed and derivative cleanup could not restore the storage limit"
+                    ) from quota_error
             raise
         finally:
             temporary_dir_context.cleanup()
@@ -928,13 +945,16 @@ class MediaIntelligence:
 
     def cleanup_stale_keyframes(self, asset_id: str, keep: set[str]) -> None:
         if not _ASSET_ID.fullmatch(asset_id):
-            return
+            raise MediaAnalysisError("invalid asset id while cleaning stale keyframes")
         directory = _derivatives_dir(self.store)
         prefix = f"{asset_id}-analysis-"
+        failures: list[OSError] = []
         for path in directory.glob(f"{prefix}*.jpg"):
             if path.name in keep or path.is_symlink():
                 continue
             try:
                 path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as error:
+                failures.append(error)
+        if failures:
+            raise MediaAnalysisError("could not remove stale analysis keyframes") from failures[0]

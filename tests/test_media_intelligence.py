@@ -474,6 +474,8 @@ class MediaIntelligenceTests(unittest.TestCase):
         observed = []
 
         def exact_replacement_check(store, *, replacing=None, additional_bytes=0):
+            if replacing is None and additional_bytes == 0:
+                return original_check(store)
             observed.append((replacing, additional_bytes))
             self.assertTrue(old_names.issubset(replacing))
             self.assertIn(cache.name, replacing)
@@ -491,6 +493,19 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertNotEqual(second["analysis_id"], first["analysis_id"])
         self.assertEqual(len(observed), 1)
         self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
+
+    def test_reanalysis_keyframe_cleanup_failure_is_not_a_success_or_quota_overrun(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        with patch.object(
+            self.analyzer, "cleanup_stale_keyframes",
+            side_effect=MediaAnalysisError("could not remove stale analysis keyframes"),
+        ):
+            with self.assertRaisesRegex(MediaAnalysisError, "could not remove stale analysis keyframes"):
+                self.analyzer.analyze(self.asset["id"], scene_threshold=0.25)
+        self.store._check_derivative_total()
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        self.assertTrue(all((self.store.root / "derivatives" / name).is_file()
+                            for name in first["keyframes"]))
 
     def test_scene_count_is_bounded_and_reports_truncation(self):
         result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=1)
