@@ -185,6 +185,16 @@ class AssetStore:
         return [dict(item) for item in self._read_manifest()]
 
     @_store_transaction
+    def verified_asset(self, asset_id: str, *, kind: str | None = None) -> tuple[dict[str, Any], Path]:
+        """Return a managed asset only after checking its bytes and probe metadata."""
+        record = self._asset(asset_id)
+        if kind is not None and record["kind"] != kind:
+            raise ValueError(f"asset must be {kind}")
+        path = self._managed_path(record)
+        self._verify_managed(path, record)
+        return dict(record), path
+
+    @_store_transaction
     def create_thumbnail(self, asset_id: str, *, ffmpeg: str = "ffmpeg", timeout: float = 20) -> dict[str, Any]:
         """Create a small JPEG derivative for a validated video or still image."""
         record = self._asset(asset_id)

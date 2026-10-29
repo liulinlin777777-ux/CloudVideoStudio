@@ -75,3 +75,13 @@ class PreviewContract(unittest.TestCase):
   p=self.project();p['sequences'][0]['fps_num']=25;p['sequences'][0]['fps_den']=1
   code,b=self.edit(p,'move','tone880-clip',start_frame=35);self.assertEqual(code,200,b)
   self.assertEqual(b['project']['sequences'][0]['fps_num'],25)
+
+ def test_media_search_and_analysis_routes_keep_loopback_and_asset_scope(self):
+  code,body=self.request('/assets/search?q=clip')
+  self.assertEqual(code,200,body);self.assertEqual(body,{'assets':[]})
+  self.assertEqual(self.request('/assets/search?q='+('x'*121))[0],400)
+  asset_id='a'*32
+  body={'scene_threshold':0.35,'max_scenes':24}
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin='https://evil.example')[0],403)
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin=f'http://127.0.0.1:{self.port}')[0],400)
+  self.assertIn(self.request(f'/assets/{asset_id}/keyframes/0')[0],[400,404])
