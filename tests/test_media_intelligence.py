@@ -287,6 +287,7 @@ class MediaIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(relinked["sha256"], self.asset["sha256"])
         self.assertEqual(relinked["filename"], "renamed-same-byte-clip.mp4")
+        self.assertFalse(relinked["analysis_cleanup_pending"])
         self.assertFalse(cache.exists())
         self.assertTrue(all(not path.exists() for path in keyframes))
         self.assertIsNone(get_analysis(self.store, self.asset["id"]))
@@ -304,6 +305,16 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertTrue(cache.is_file())
         self.assertTrue(all(path.is_file() for path in keyframes))
         self.assertEqual(get_analysis(self.store, self.asset["id"]), result)
+
+    def test_post_commit_cleanup_failure_reports_success_with_pending_cleanup(self):
+        self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        with patch.object(self.store, "_remove_analysis_derivatives", side_effect=OSError("locked")):
+            relinked = self.store.relink(
+                self.asset["id"], self.source, filename="committed-renamed-clip.mp4",
+            )
+        self.assertTrue(relinked["analysis_cleanup_pending"])
+        self.assertEqual(self.store.list_assets()[0]["filename"], "committed-renamed-clip.mp4")
+        self.assertTrue((self.store.root / relinked["path"]).is_file())
 
     def test_analysis_deadline_is_created_before_managed_file_validation(self):
         captured = {}

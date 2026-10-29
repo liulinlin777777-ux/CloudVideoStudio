@@ -413,11 +413,17 @@ class AssetStore:
                 old_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            self._remove_analysis_derivatives(asset_id)
+            cleanup_pending = False
+            try:
+                self._remove_analysis_derivatives(asset_id)
+            except (OSError, ValueError):
+                cleanup_pending = True
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        return dict(record)
+        result = dict(record)
+        result["analysis_cleanup_pending"] = cleanup_pending
+        return result
 
     def _remove_analysis_derivatives(self, asset_id: str) -> None:
         """Discard cached analysis files before a relinked record is published."""
