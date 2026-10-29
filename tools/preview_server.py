@@ -13,7 +13,7 @@ from pathlib import Path
 from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.project import Project
 from cloud_video_studio.creative_brief import (
-    MAX_ARTIFACT_BYTES, artifact_path, artifact_sha256, read_brief, save_brief,
+    MAX_ARTIFACT_BYTES, BriefRevisionConflict, artifact_path, artifact_sha256, read_brief, save_brief,
 )
 from cloud_video_studio.timeline_edits import (
     add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
@@ -244,15 +244,20 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/creative-brief':
                 if not self.browser_origin():
                     return self.reply(403, {'error': 'ORIGIN_DENIED'})
-                if not isinstance(data, dict) or set(data) != {'action', 'brief'}:
+                if not isinstance(data, dict) or set(data) != {'action', 'brief', 'expected_sha256'}:
                     raise ValueError('invalid creative brief request')
                 if data['action'] not in {'save', 'approve'}:
                     raise ValueError('unknown creative brief action')
                 project = current()
-                brief = save_brief(
-                    artifact_path(root, project.id), data['brief'], project.id,
-                    approve=data['action'] == 'approve',
-                )
+                try:
+                    brief = save_brief(
+                        artifact_path(root, project.id), data['brief'], project.id,
+                        approve=data['action'] == 'approve', expected_sha256=data['expected_sha256'],
+                    )
+                except BriefRevisionConflict as error:
+                    return self.reply(409, {
+                        'error': 'BRIEF_REVISION_CONFLICT', 'current_sha256': error.current_sha256,
+                    })
                 return self.reply(200, {'status': 'approved' if data['action'] == 'approve' else 'saved',
                                         'brief': brief, 'sha256': artifact_sha256(brief)})
             if self.path == '/edit':

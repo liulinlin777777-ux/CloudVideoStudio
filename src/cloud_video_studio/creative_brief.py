@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,10 +32,19 @@ BRIEF_FIELDS = {
 }
 SOURCE_FIELDS = {"id", "source_type", "title", "publisher", "citation", "locator", "notes"}
 CLAIM_FIELDS = {"id", "text", "source_ids"}
+_BRIEF_WRITE_LOCK = threading.RLock()
+
+
+class BriefRevisionConflict(ValueError):
+    """A save was based on an older brief revision."""
+
+    def __init__(self, current_sha256: str) -> None:
+        self.current_sha256 = current_sha256
+        super().__init__("creative brief changed since it was loaded")
 
 
 def brief_id_for_project(project_id: str) -> str:
-    if not isinstance(project_id, str) or not project_id.strip() or len(project_id) > 160:
+    if not isinstance(project_id, str) or not project_id.strip():
         raise ValueError("invalid project id")
     return uuid.uuid5(PROJECT_NAMESPACE, project_id).hex
 
@@ -108,8 +118,8 @@ def _normalize_input(data: Any, expected_project_id: str) -> dict[str, Any]:
             raise ValueError("claim ids must be unique")
         claim_ids.add(claim_id)
         refs = claim.get("source_ids")
-        if not isinstance(refs, list) or not refs:
-            raise ValueError("every factual claim needs at least one source citation")
+        if not isinstance(refs, list):
+            raise ValueError("claim source ids must be a list")
         normalized_refs = [_identifier(ref, "claim source id") for ref in refs]
         if len(set(normalized_refs)) != len(normalized_refs):
             raise ValueError("claim citations must be unique")
@@ -228,43 +238,57 @@ def read_brief(path: Path, project_id: str) -> dict[str, Any]:
         os.close(descriptor)
 
 
-def save_brief(path: Path, data: Any, project_id: str, *, approve: bool = False) -> dict[str, Any]:
-    existing = read_brief(path, project_id)
-    normalized = _normalize_input(data, project_id)
-    if approve:
-        if not normalized["audience"] or not normalized["goal"] or not normalized["topic"]:
-            raise ValueError("audience, goal and topic are required before approval")
-        if not normalized["sources"] or not normalized["claims"]:
-            raise ValueError("add cited research and at least one sourced claim before approval")
-        if any(not claim["source_ids"] for claim in normalized["claims"]):
-            raise ValueError("every factual claim needs a source citation")
-    now = datetime.now(timezone.utc).isoformat()
-    result = {
-        **normalized,
-        "created_at": existing["created_at"] or now,
-        "updated_at": now,
-        "review": {"status": "approved", "approved_at": now} if approve else {
-            "status": "draft", "approved_at": None,
-        },
-    }
-    result = validate_stored_brief(result, project_id)
-    if path.is_symlink():
-        raise ValueError("creative brief artifact must not be a symlink")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    if len(payload) > MAX_ARTIFACT_BYTES:
-        raise ValueError("creative brief artifact exceeds the size limit")
-    fd, temporary = tempfile.mkstemp(prefix=".creative-brief-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
+def save_brief(
+    path: Path,
+    data: Any,
+    project_id: str,
+    *,
+    approve: bool = False,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    with _BRIEF_WRITE_LOCK:
+        existing = read_brief(path, project_id)
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise ValueError("expected brief revision must be a SHA-256 digest")
+            current_sha256 = artifact_sha256(existing)
+            if expected_sha256 != current_sha256:
+                raise BriefRevisionConflict(current_sha256)
+        normalized = _normalize_input(data, project_id)
+        if approve:
+            if not normalized["audience"] or not normalized["goal"] or not normalized["topic"]:
+                raise ValueError("audience, goal and topic are required before approval")
+            if not normalized["sources"] or not normalized["claims"]:
+                raise ValueError("add cited research and at least one sourced claim before approval")
+            if any(not claim["source_ids"] for claim in normalized["claims"]):
+                raise ValueError("every factual claim needs a source citation")
+        now = datetime.now(timezone.utc).isoformat()
+        result = {
+            **normalized,
+            "created_at": existing["created_at"] or now,
+            "updated_at": now,
+            "review": {"status": "approved", "approved_at": now} if approve else {
+                "status": "draft", "approved_at": None,
+            },
+        }
+        result = validate_stored_brief(result, project_id)
         if path.is_symlink():
             raise ValueError("creative brief artifact must not be a symlink")
-        os.replace(temporary, path)
-        temporary = ""
-    finally:
-        if temporary:
-            Path(temporary).unlink(missing_ok=True)
-    return result
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if len(payload) > MAX_ARTIFACT_BYTES:
+            raise ValueError("creative brief artifact exceeds the size limit")
+        fd, temporary = tempfile.mkstemp(prefix=".creative-brief-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if path.is_symlink():
+                raise ValueError("creative brief artifact must not be a symlink")
+            os.replace(temporary, path)
+            temporary = ""
+        finally:
+            if temporary:
+                Path(temporary).unlink(missing_ok=True)
+        return result

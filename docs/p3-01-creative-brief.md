@@ -13,6 +13,8 @@ This change adds a human-facing, project-bound brief for audience, goal, topic, 
 ## Storage and boundaries
 
 - The artifact is JSON schema version 1, stored beside the local preview project under a fixed project-derived filename. Writes use a temporary file and atomic replacement.
+- Each browser write includes the digest of the revision it loaded. A stale tab receives a conflict and cannot overwrite or approve a newer revision.
+- Drafts may contain claims whose citations are still in progress; approval still requires at least one cited claim and valid source records.
 - The artifact is bound to the current local project ID; its file path is derived by the server and is never accepted from browser input.
 - HTTP writes require the local editor origin. No external service, AI provider, web scraper, publishing integration or additional dependency is used.
 - A local approval records that the user clicked the approval control. It does not identify a person, prove source accuracy, or replace later product review.

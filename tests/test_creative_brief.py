@@ -49,6 +49,24 @@ class CreativeBriefModelTests(unittest.TestCase):
                 save_brief(path, uncited, "p0", approve=True)
             self.assertEqual(read_brief(path, "p0")["review"]["status"], "approved")
 
+    def test_unfinished_claim_can_be_saved_as_draft_but_not_approved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = artifact_path(Path(directory), "p0")
+            brief = sourced_brief()
+            brief["claims"][0]["source_ids"] = []
+            saved = save_brief(path, brief, "p0")
+            self.assertEqual(saved["claims"][0]["source_ids"], [])
+            self.assertEqual(saved["review"]["status"], "draft")
+            with self.assertRaisesRegex(ValueError, "source citation"):
+                save_brief(path, brief, "p0", approve=True)
+
+    def test_project_id_limit_matches_project_model(self):
+        long_project_id = "p" * 161
+        with tempfile.TemporaryDirectory() as directory:
+            path = artifact_path(Path(directory), long_project_id)
+            saved = save_brief(path, default_brief(long_project_id), long_project_id)
+            self.assertEqual(read_brief(path, long_project_id), saved)
+
     def test_user_supplied_review_metadata_cannot_self_approve(self):
         with tempfile.TemporaryDirectory() as directory:
             path = artifact_path(Path(directory), "p0")
@@ -181,7 +199,9 @@ class CreativeBriefHttpTests(unittest.TestCase):
         brief = sourced_brief(initial["brief"]["project_id"])
         brief["brief_id"] = initial["brief"]["brief_id"]
 
-        status, saved = self.request("POST", "/creative-brief", {"action": "save", "brief": brief})
+        status, saved = self.request("POST", "/creative-brief", {
+            "action": "save", "brief": brief, "expected_sha256": initial["sha256"],
+        })
         self.assertEqual(status, 200)
         self.assertEqual(saved["brief"]["review"]["status"], "draft")
         status, loaded = self.request("GET", "/creative-brief")
@@ -189,7 +209,9 @@ class CreativeBriefHttpTests(unittest.TestCase):
         self.assertEqual(loaded["brief"]["topic"], "Example topic")
         self.assertEqual(loaded["brief"]["claims"][0]["source_ids"], ["1" * 32])
 
-        status, approved = self.request("POST", "/creative-brief", {"action": "approve", "brief": loaded["brief"]})
+        status, approved = self.request("POST", "/creative-brief", {
+            "action": "approve", "brief": loaded["brief"], "expected_sha256": loaded["sha256"],
+        })
         self.assertEqual(status, 200)
         self.assertEqual(approved["brief"]["review"]["status"], "approved")
         status, persisted = self.request("GET", "/creative-brief")
@@ -198,18 +220,53 @@ class CreativeBriefHttpTests(unittest.TestCase):
 
         edited = persisted["brief"]
         edited["topic"] = "Revised topic"
-        status, draft = self.request("POST", "/creative-brief", {"action": "save", "brief": edited})
+        status, draft = self.request("POST", "/creative-brief", {
+            "action": "save", "brief": edited, "expected_sha256": persisted["sha256"],
+        })
         self.assertEqual(status, 200)
         self.assertEqual(draft["brief"]["review"]["status"], "draft")
         self.assertNotEqual(draft["brief"]["review"]["approved_at"], approved["brief"]["review"]["approved_at"])
+
+    def test_stale_revision_cannot_overwrite_or_approve_newer_brief(self):
+        _, initial = self.request("GET", "/creative-brief")
+        brief = sourced_brief(initial["brief"]["project_id"])
+        brief["brief_id"] = initial["brief"]["brief_id"]
+        status, first = self.request("POST", "/creative-brief", {
+            "action": "save", "brief": brief, "expected_sha256": initial["sha256"],
+        })
+        self.assertEqual(status, 200)
+
+        newer = copy.deepcopy(first["brief"])
+        newer["topic"] = "Newest saved topic"
+        status, current = self.request("POST", "/creative-brief", {
+            "action": "save", "brief": newer, "expected_sha256": first["sha256"],
+        })
+        self.assertEqual(status, 200)
+
+        stale = copy.deepcopy(first["brief"])
+        stale["topic"] = "Stale topic"
+        for action in ("save", "approve"):
+            status, rejected = self.request("POST", "/creative-brief", {
+                "action": action, "brief": stale, "expected_sha256": first["sha256"],
+            })
+            self.assertEqual(status, 409)
+            self.assertEqual(rejected["error"], "BRIEF_REVISION_CONFLICT")
+            self.assertEqual(rejected["current_sha256"], current["sha256"])
+        _, persisted = self.request("GET", "/creative-brief")
+        self.assertEqual(persisted["brief"]["topic"], "Newest saved topic")
+        self.assertEqual(persisted["brief"]["review"]["status"], "draft")
 
     def test_cross_origin_write_is_rejected_without_changing_saved_brief(self):
         _, initial = self.request("GET", "/creative-brief")
         brief = sourced_brief(initial["brief"]["project_id"])
         brief["brief_id"] = initial["brief"]["brief_id"]
-        status, _ = self.request("POST", "/creative-brief", {"action": "save", "brief": brief})
+        status, _ = self.request("POST", "/creative-brief", {
+            "action": "save", "brief": brief, "expected_sha256": initial["sha256"],
+        })
         self.assertEqual(status, 200)
-        status, _ = self.request("POST", "/creative-brief", {"action": "approve", "brief": brief}, origin="https://attacker.invalid")
+        status, _ = self.request("POST", "/creative-brief", {
+            "action": "approve", "brief": brief, "expected_sha256": initial["sha256"],
+        }, origin="https://attacker.invalid")
         self.assertEqual(status, 403)
         status, loaded = self.request("GET", "/creative-brief")
         self.assertEqual(status, 200)
@@ -223,8 +280,9 @@ class CreativeBriefHttpTests(unittest.TestCase):
             "id": f"{index + 1:032x}", "source_type": "other", "title": f"Source {index}",
             "publisher": "", "citation": f"local-fixture:{index}", "locator": "", "notes": "n" * 1600,
         } for index in range(50)]
-        self.assertGreater(len(json.dumps({"action": "save", "brief": brief}).encode()), 65536)
-        status, saved = self.request("POST", "/creative-brief", {"action": "save", "brief": brief})
+        request = {"action": "save", "brief": brief, "expected_sha256": initial["sha256"]}
+        self.assertGreater(len(json.dumps(request).encode()), 65536)
+        status, saved = self.request("POST", "/creative-brief", request)
         self.assertEqual(status, 200)
         self.assertEqual(len(saved["brief"]["sources"]), 50)
         self.assertEqual(saved["brief"]["review"]["status"], "draft")
