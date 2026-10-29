@@ -316,6 +316,20 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertEqual(self.store.list_assets()[0]["filename"], "committed-renamed-clip.mp4")
         self.assertTrue((self.store.root / relinked["path"]).is_file())
 
+    def test_relink_reports_nonfile_analysis_entry_as_pending_cleanup(self):
+        self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        cache.unlink()
+        cache.mkdir()
+
+        relinked = self.store.relink(
+            self.asset["id"], self.source, filename="renamed-with-unsafe-cache.mp4",
+        )
+
+        self.assertTrue(relinked["analysis_cleanup_pending"])
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(self.store.list_assets()[0]["filename"], "renamed-with-unsafe-cache.mp4")
+
     def test_analysis_deadline_is_created_before_managed_file_validation(self):
         captured = {}
 
