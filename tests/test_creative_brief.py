@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from cloud_video_studio.creative_brief import (
+    artifact_sha256,
     artifact_path,
     default_brief,
     read_brief,
@@ -35,6 +36,50 @@ def sourced_brief(project_id="p0"):
 
 
 class CreativeBriefModelTests(unittest.TestCase):
+    def test_brief_revision_transaction_waits_for_another_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = artifact_path(Path(directory), "p0")
+            initial = save_brief(path, sourced_brief(), "p0")
+            expected = artifact_sha256(initial)
+            updated = copy.deepcopy(initial)
+            updated["topic"] = "Cross-process writer"
+            lock_path = path.with_name(f".{path.name}.lock")
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            started = Path(directory) / "child-started"
+            completed = Path(directory) / "child-completed"
+            script = """
+import json, sys
+from pathlib import Path
+from cloud_video_studio.creative_brief import save_brief
+path, project_id, expected, payload, started, completed = sys.argv[1:]
+Path(started).write_text('started')
+save_brief(Path(path), json.loads(payload), project_id, expected_sha256=expected)
+Path(completed).write_text('saved')
+"""
+            process = None
+            try:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                process = subprocess.Popen([
+                    sys.executable, "-c", script, str(path), "p0", expected,
+                    json.dumps(updated), str(started), str(completed),
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   env=os.environ.copy())
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not started.exists() and process.poll() is None:
+                    time.sleep(0.01)
+                self.assertTrue(started.exists(), "child process did not reach the save transaction")
+                time.sleep(0.1)
+                self.assertIsNone(process.poll(), "brief save bypassed the cross-process revision lock")
+            finally:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, (stdout.decode(), stderr.decode()))
+            self.assertEqual(completed.read_text(), "saved")
+            self.assertEqual(read_brief(path, "p0")["topic"], "Cross-process writer")
+
     def test_approval_requires_a_complete_brief_and_cited_claims(self):
         with tempfile.TemporaryDirectory() as directory:
             path = artifact_path(Path(directory), "p0")
@@ -255,6 +300,20 @@ class CreativeBriefHttpTests(unittest.TestCase):
         _, persisted = self.request("GET", "/creative-brief")
         self.assertEqual(persisted["brief"]["topic"], "Newest saved topic")
         self.assertEqual(persisted["brief"]["review"]["status"], "draft")
+
+    def test_null_or_malformed_revision_digest_is_rejected(self):
+        _, initial = self.request("GET", "/creative-brief")
+        brief = sourced_brief(initial["brief"]["project_id"])
+        brief["brief_id"] = initial["brief"]["brief_id"]
+        for digest in (None, True, "a" * 63, "A" * 64):
+            with self.subTest(digest=digest):
+                status, _ = self.request("POST", "/creative-brief", {
+                    "action": "save", "brief": brief, "expected_sha256": digest,
+                })
+                self.assertEqual(status, 400)
+        _, persisted = self.request("GET", "/creative-brief")
+        self.assertEqual(persisted["sha256"], initial["sha256"])
+        self.assertEqual(persisted["brief"], initial["brief"])
 
     def test_cross_origin_write_is_rejected_without_changing_saved_brief(self):
         _, initial = self.request("GET", "/creative-brief")

@@ -7,6 +7,7 @@ claims that citations have been independently verified.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,32 @@ class BriefRevisionConflict(ValueError):
     def __init__(self, current_sha256: str) -> None:
         self.current_sha256 = current_sha256
         super().__init__("creative brief changed since it was loaded")
+
+
+@contextmanager
+def _brief_file_lock(path: Path):
+    """Serialize revision read/check/write across preview-server processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    if lock_path.is_symlink():
+        raise ValueError("creative brief lock must not be a symlink")
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    locked = False
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("creative brief lock must be a regular, unaliased file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def brief_id_for_project(project_id: str) -> str:
@@ -246,7 +274,7 @@ def save_brief(
     approve: bool = False,
     expected_sha256: str | None = None,
 ) -> dict[str, Any]:
-    with _BRIEF_WRITE_LOCK:
+    with _BRIEF_WRITE_LOCK, _brief_file_lock(path):
         existing = read_brief(path, project_id)
         if expected_sha256 is not None:
             if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):

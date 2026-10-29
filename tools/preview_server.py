@@ -248,6 +248,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('invalid creative brief request')
                 if data['action'] not in {'save', 'approve'}:
                     raise ValueError('unknown creative brief action')
+                if (not isinstance(data['expected_sha256'], str)
+                        or not re.fullmatch(r'[0-9a-f]{64}', data['expected_sha256'])):
+                    raise ValueError('invalid expected brief revision')
                 project = current()
                 try:
                     brief = save_brief(
