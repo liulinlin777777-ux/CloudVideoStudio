@@ -34,6 +34,7 @@ _SCENE_LINE = re.compile(
 )
 _CACHE_SCHEMA = 3
 _CACHE_BYTES_LIMIT = 1024 * 1024
+_ROLLBACK_LOCK_TIMEOUT_SECONDS = 5.0
 _KEYFRAME_BYTES_LIMIT = 2 * 1024 * 1024
 _KEYFRAME_COUNT_LIMIT = 25
 _SCENE_COUNT_LIMIT = 24
@@ -268,6 +269,8 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
         return None
     run_id = data.get("analysis_id")
     if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        return None
+    if data.get("_publication_state", "committed") != "committed":
         return None
     if len(data["scenes"]) != len(keyframes):
         return None
@@ -730,7 +733,9 @@ class MediaIntelligence:
                 "scenes": scenes,
                 "keyframes": [name for _, name in prepared_images],
             }
-            encoded_cache_size = len(_cache_payload(result))
+            pending_cache = dict(result)
+            pending_cache["_publication_state"] = "pending"
+            encoded_cache_size = len(_cache_payload(pending_cache))
             publication = publication_lock if publication_lock is not None else self.store._lock
             with _lock_until(publication, deadline):
                 with _analysis_store_lock(self.store, deadline):
@@ -762,23 +767,28 @@ class MediaIntelligence:
                         os.replace(image, directory / name)
                         new_keyframes.append(name)
                     self._remaining(deadline)
-                    self._write_cache(asset_id, result)
+                    self._write_cache(asset_id, pending_cache)
                     cache_written = True
                     self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
                     self.store._check_derivative_total()
+                    self._write_cache(asset_id, result)
                     cache_committed = True
             return result
         except BaseException as failure:
             if not cache_committed:
-                if cache_written:
+                if cache_written or new_keyframes:
                     try:
-                        _cache_path(self.store, asset_id).unlink(missing_ok=True)
+                        self._rollback_analysis_publication(
+                            asset_id,
+                            result["analysis_id"],
+                            result["source_sha256"],
+                            new_keyframes,
+                            publication,
+                            cache_written=cache_written,
+                        )
                     except (OSError, ValueError):
-                        pass
-                for name in new_keyframes:
-                    try:
-                        (directory / name).unlink(missing_ok=True)
-                    except OSError:
+                        # Keep the original analysis error and fail closed if
+                        # the current publication cannot be identified safely.
                         pass
                 try:
                     self.store._check_derivative_total()
@@ -789,6 +799,79 @@ class MediaIntelligence:
             raise
         finally:
             temporary_dir_context.cleanup()
+
+    def _rollback_analysis_publication(
+        self,
+        asset_id: str,
+        analysis_id: str,
+        source_sha256: str,
+        new_keyframes: list[str],
+        publication: Any,
+        *,
+        cache_written: bool,
+    ) -> None:
+        """Remove this failed run's files without undoing a later publisher."""
+        deadline = time.monotonic() + _ROLLBACK_LOCK_TIMEOUT_SECONDS
+        with _lock_until(publication, deadline):
+            with _analysis_store_lock(self.store, deadline):
+                cache_path = _cache_path(self.store, asset_id)
+                current_cache = None
+                try:
+                    before = cache_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                            or before.st_size <= 0 or before.st_size > _CACHE_BYTES_LIMIT):
+                        return
+                    descriptor = os.open(
+                        cache_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        opened = os.fstat(descriptor)
+                        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+                            return
+                        payload = os.read(descriptor, _CACHE_BYTES_LIMIT + 1)
+                    finally:
+                        os.close(descriptor)
+                    if len(payload) > _CACHE_BYTES_LIMIT:
+                        return
+                    try:
+                        current_cache = json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return
+                    if (not isinstance(current_cache, dict)
+                            or not isinstance(current_cache.get("keyframes"), list)):
+                        return
+
+                current_keyframes = {
+                    name for name in (current_cache or {}).get("keyframes", [])
+                    if isinstance(name, str) and Path(name).name == name
+                }
+                owns_cache = bool(
+                    current_cache
+                    and current_cache.get("schema_version") == _CACHE_SCHEMA
+                    and current_cache.get("asset_id") == asset_id
+                    and current_cache.get("analysis_id") == analysis_id
+                    and current_cache.get("source_sha256") == source_sha256
+                )
+                if cache_written and owns_cache:
+                    cache_path.unlink(missing_ok=True)
+                    current_keyframes.clear()
+
+                expected_prefix = f"{asset_id}-analysis-{analysis_id}-"
+                for name in new_keyframes:
+                    if (not isinstance(name, str) or not name.startswith(expected_prefix)
+                            or not name.endswith(".jpg") or name in current_keyframes):
+                        continue
+                    image = cache_path.parent / name
+                    try:
+                        info = image.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                        image.unlink(missing_ok=True)
 
     @staticmethod
     def _replaceable_analysis_files(directory: Path, asset_id: str) -> set[str]:

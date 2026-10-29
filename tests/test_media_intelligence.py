@@ -532,6 +532,95 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertTrue(all((self.store.root / "derivatives" / name).is_file()
                             for name in first["keyframes"]))
 
+    def test_failed_publication_cache_stays_hidden_if_rollback_cannot_lock(self):
+        with patch.object(
+            self.analyzer, "cleanup_stale_keyframes",
+            side_effect=MediaAnalysisError("injected cleanup failure"),
+        ), patch.object(
+            self.analyzer, "_rollback_analysis_publication",
+            side_effect=MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED"),
+        ):
+            with self.assertRaisesRegex(MediaAnalysisError, "injected cleanup failure"):
+                self.analyzer.analyze(
+                    self.asset["id"], scene_threshold=0.25, force=True,
+                )
+
+        cache_path = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        pending = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(pending["_publication_state"], "pending")
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        with self.assertRaisesRegex(MediaAnalysisError, "keyframe not found"):
+            read_keyframe(
+                self.store, self.asset["id"], 0,
+                analysis_id=pending["analysis_id"],
+            )
+
+        recovered = self.analyzer.analyze(
+            self.asset["id"], scene_threshold=0.25, force=True,
+        )
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), recovered)
+        self.store._check_derivative_total()
+
+    def test_failed_analysis_rollback_preserves_a_concurrent_successful_cache(self):
+        cleanup_calls = 0
+        cleanup_guard = threading.Lock()
+        original_cleanup = self.analyzer.cleanup_stale_keyframes
+
+        def fail_first_cleanup(asset_id, keep):
+            nonlocal cleanup_calls
+            with cleanup_guard:
+                cleanup_calls += 1
+                should_fail = cleanup_calls == 1
+            if should_fail:
+                raise MediaAnalysisError("injected stale-keyframe cleanup failure")
+            return original_cleanup(asset_id, keep)
+
+        rollback_started = threading.Event()
+        permit_rollback = threading.Event()
+        original_rollback = self.analyzer._rollback_analysis_publication
+        failed_analysis_ids = []
+        failed_analysis_errors = []
+
+        def wait_until_success_is_published(*args, **kwargs):
+            failed_analysis_ids.append(args[1])
+            rollback_started.set()
+            if not permit_rollback.wait(timeout=15):
+                raise AssertionError("concurrent successful analysis did not finish")
+            return original_rollback(*args, **kwargs)
+
+        def fail_once():
+            try:
+                self.analyzer.analyze(
+                    self.asset["id"], scene_threshold=0.20, force=True,
+                )
+            except BaseException as error:
+                failed_analysis_errors.append(error)
+
+        worker = threading.Thread(target=fail_once, daemon=True)
+        with patch.object(self.analyzer, "cleanup_stale_keyframes", side_effect=fail_first_cleanup), \
+                patch.object(self.analyzer, "_rollback_analysis_publication",
+                             side_effect=wait_until_success_is_published):
+            worker.start()
+            try:
+                self.assertTrue(rollback_started.wait(timeout=15))
+                successful = self.analyzer.analyze(
+                    self.asset["id"], scene_threshold=0.25, force=True,
+                )
+            finally:
+                permit_rollback.set()
+                worker.join(timeout=15)
+
+        self.assertFalse(worker.is_alive(), "failed analysis rollback did not finish")
+        self.assertEqual(len(failed_analysis_errors), 1)
+        self.assertRegex(str(failed_analysis_errors[0]), "injected stale-keyframe cleanup failure")
+        self.assertEqual(len(failed_analysis_ids), 1)
+        self.assertNotEqual(failed_analysis_ids[0], successful["analysis_id"])
+        cache_path = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(cached["analysis_id"], successful["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), successful)
+        self.store._check_derivative_total()
+
     def test_scene_count_is_bounded_and_reports_truncation(self):
         result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=1)
         self.assertGreaterEqual(result["scene_detection"]["candidate_count"], 2)
