@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 import fcntl
 from contextlib import contextmanager
@@ -125,18 +127,37 @@ class AssetStore:
                 raise ValueError("symlink path ancestors are not accepted")
 
     @contextmanager
-    def _process_lock(self):
+    def _process_lock(self, timeout: float | None = None):
+        if (timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                     or not math.isfinite(timeout) or timeout < 0)):
+            raise ValueError("asset lock timeout must be finite and non-negative")
         if self.lockfile.is_symlink():
             raise ValueError("asset lock must not be a symlink")
         descriptor = os.open(self.lockfile, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        acquired = False
         try:
             lock_info = os.fstat(descriptor)
             if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1:
                 raise ValueError("asset lock must be a regular, unaliased file")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if timeout is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                acquired = True
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("asset store lock deadline exceeded")
+                        time.sleep(min(0.01, remaining))
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
     @staticmethod

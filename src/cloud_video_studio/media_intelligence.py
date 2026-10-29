@@ -6,7 +6,7 @@ and FFprobe binaries. It does not upload footage or infer speech transcripts.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from fractions import Fraction
 import hashlib
@@ -273,6 +273,35 @@ def _check_deadline(deadline: float | None) -> None:
         raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED")
 
 
+@contextmanager
+def _lock_until(lock: Any, deadline: float):
+    """Acquire an in-process lock only for the analysis time still available."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not lock.acquire(timeout=remaining):
+        raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED")
+    try:
+        _check_deadline(deadline)
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _analysis_store_lock(store: AssetStore, deadline: float):
+    """Bound both thread and process lock waits by the same analysis deadline."""
+    with _lock_until(store._lock, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED")
+        with ExitStack() as locks:
+            try:
+                locks.enter_context(store._process_lock(timeout=remaining))
+            except TimeoutError as exc:
+                raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED") from exc
+            _check_deadline(deadline)
+            yield
+
+
 def _hash_source_under_deadline(
     path: Path, deadline: float | None, *, expected_fingerprint: tuple[int, int, int, int, int, int, int] | None = None,
 ) -> str:
@@ -510,14 +539,14 @@ class MediaIntelligence:
             raise MediaAnalysisError(f"max scenes must be between 1 and {_SCENE_COUNT_LIMIT}")
         threshold = round(float(scene_threshold), 3)
         deadline = time.monotonic() + self.timeout
-        with self.store._lock, self.store._process_lock():
+        with _analysis_store_lock(self.store, deadline):
             record, source, probe = self._verified_asset_under_store_lock(asset_id, deadline=deadline)
             cached = _load_analysis(self.store, asset_id, record)
         if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
                 and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
             publication = publication_lock if publication_lock is not None else self.store._lock
-            with publication:
-                with self.store._lock, self.store._process_lock():
+            with _lock_until(publication, deadline):
+                with _analysis_store_lock(self.store, deadline):
                     record, source, probe = self._verified_asset_under_store_lock(
                         asset_id, deadline=deadline,
                     )
@@ -639,8 +668,8 @@ class MediaIntelligence:
             }
             encoded_cache_size = len(_cache_payload(result))
             publication = publication_lock if publication_lock is not None else self.store._lock
-            with publication:
-                with self.store._lock, self.store._process_lock():
+            with _lock_until(publication, deadline):
+                with _analysis_store_lock(self.store, deadline):
                     self._remaining(deadline)
                     after_record = self.store._asset(asset_id)
                     if (after_record.get("sha256") != record.get("sha256")

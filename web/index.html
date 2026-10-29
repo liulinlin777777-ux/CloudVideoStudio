@@ -15,7 +15,8 @@ function filterAssetLibrary(){
 function drawAssetLibrary(){
  const library=$('asset-library');library.replaceChildren();
  for(const asset of assetRows){
-  const haystack=JSON.stringify({filename:asset.filename,kind:asset.kind,size_bytes:asset.size_bytes,metadata:asset.metadata,analysis:asset.analysis||null}).toLowerCase();
+  const sceneTimes=(asset.analysis?.scenes||[]).filter(scene=>Number.isFinite(scene.start_seconds)).map(scene=>`${scene.start_seconds.toFixed(3)}s`).join(' ');
+  const haystack=(JSON.stringify({filename:asset.filename,kind:asset.kind,size_bytes:asset.size_bytes,metadata:asset.metadata,analysis:asset.analysis||null})+' '+sceneTimes).toLowerCase();
   const row=document.createElement('div');row.dataset.searchText=haystack;
   const label=document.createElement('span');label.textContent=`${asset.filename} · ${asset.kind} · ${asset.size_bytes} bytes · ${asset.sha256.slice(0,12)}`;
   const metadata=document.createElement('small');metadata.className='asset-meta';metadata.textContent=formatAssetSummary(asset);row.append(label,metadata);

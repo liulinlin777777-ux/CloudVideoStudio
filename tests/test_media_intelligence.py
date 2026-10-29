@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -101,6 +102,79 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertEqual(search_assets(self.store, "h264")[0]["id"], self.asset["id"])
         self.assertEqual(search_assets(self.store, "not-present"), [])
 
+    def test_analysis_deadline_bounds_thread_lock_wait(self):
+        analyzer = MediaIntelligence(self.store, timeout=0.05)
+        failures = []
+
+        def analyze():
+            try:
+                analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+            except BaseException as error:
+                failures.append(error)
+
+        self.store._lock.acquire()
+        worker = threading.Thread(target=analyze, daemon=True)
+        try:
+            worker.start()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive(), "analysis exceeded its deadline waiting for the store lock")
+        finally:
+            self.store._lock.release()
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], MediaAnalysisError)
+        self.assertIn("ANALYSIS_DEADLINE_EXCEEDED", str(failures[0]))
+
+    def test_analysis_deadline_bounds_process_lock_wait(self):
+        lock_code = (
+            "import fcntl, os, sys; fd=os.open(sys.argv[1], os.O_RDWR); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); "
+            "sys.stdin.readline(); fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", lock_code, str(self.store.lockfile)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            analyzer = MediaIntelligence(self.store, timeout=0.05)
+            with self.assertRaisesRegex(MediaAnalysisError, "ANALYSIS_DEADLINE_EXCEEDED"):
+                analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        finally:
+            if process.stdin and process.poll() is None:
+                process.stdin.write("release\n")
+                process.stdin.flush()
+            process.wait(timeout=5)
+            if process.stdin:
+                process.stdin.close()
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+
+    def test_publication_lock_wait_is_deadline_bounded(self):
+        publication_lock = threading.Lock()
+        publication_lock.acquire()
+        failures = []
+
+        def acquire():
+            try:
+                with media_module._lock_until(publication_lock, time.monotonic() + 0.05):
+                    pass
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=acquire, daemon=True)
+        try:
+            worker.start()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive(), "publication exceeded its deadline waiting for the lock")
+        finally:
+            publication_lock.release()
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], MediaAnalysisError)
+        self.assertIn("ANALYSIS_DEADLINE_EXCEEDED", str(failures[0]))
+
     def test_corrupt_cache_is_reanalyzed(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
         cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
@@ -143,9 +217,9 @@ class MediaIntelligenceTests(unittest.TestCase):
         locked = False
 
         @contextmanager
-        def tracked_process_lock():
+        def tracked_process_lock(timeout=None):
             nonlocal locked
-            with original_lock():
+            with original_lock(timeout=timeout):
                 locked = True
                 try:
                     yield
@@ -370,16 +444,16 @@ class MediaIntelligenceTests(unittest.TestCase):
         relink_thread = None
 
         class WaitForRelink:
-            def __enter__(self):
-                relink_thread.join(timeout=5)
+            def acquire(self, timeout=None):
+                relink_thread.join(timeout=timeout)
                 if relink_thread.is_alive():
-                    raise AssertionError("concurrent relink did not finish after cache read released the lock")
+                    return False
                 if relink_errors:
                     raise relink_errors[0]
-                return self
+                return True
 
-            def __exit__(self, *args):
-                return False
+            def release(self):
+                return None
 
         def load_then_relink(store, asset_id, record):
             nonlocal relinked, relink_thread
