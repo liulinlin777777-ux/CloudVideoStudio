@@ -338,3 +338,10 @@ class EncodedAudioQaRegression(unittest.TestCase):
         with patch("cloud_video_studio.media.subprocess.run",return_value=SimpleNamespace(returncode=0,stderr="")):
             with self.assertRaisesRegex(RuntimeError,"incomplete"):
                 _encoded_audio_qa(Path("owned.mp4"),ffmpeg="ffmpeg",timeout=5)
+
+
+class BrowserAssetRestoreRegression(unittest.TestCase):
+    def test_asset_catalog_loads_before_restoring_saved_subtitle_selection(self):
+        page = (Path(__file__).parents[1] / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("refreshAssets().then(load)", page)
+        self.assertNotIn("load().then(refreshAssets)", page)
