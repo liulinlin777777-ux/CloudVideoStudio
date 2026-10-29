@@ -226,6 +226,18 @@ class MediaIntelligenceTests(unittest.TestCase):
             with self.subTest(channel=channel), self.assertRaisesRegex(_OutputLimitExceeded, channel):
                 _bounded_subprocess(command, timeout=5, stdout_limit=128, stderr_limit=128)
 
+    def test_analysis_duration_bounds_both_ffmpeg_input_passes(self):
+        with patch.object(media_module, "_ANALYSIS_SECONDS_LIMIT", 1.5), \
+                patch.object(self.analyzer, "_run", wraps=self.analyzer._run) as run_call:
+            result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertTrue(result["duration_truncated"])
+        commands = [call.args[0] for call in run_call.call_args_list]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            input_index = command.index("-i")
+            self.assertEqual(command[input_index - 2], "-t")
+            self.assertEqual(command[input_index - 1], "1.500000")
+
     def test_video_scene_times_keep_nonzero_stream_origin(self):
         clip = self.root / "offset-scenes.mp4"
         delayed = self.root / "delayed-video-with-audio.mp4"

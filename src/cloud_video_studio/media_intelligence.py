@@ -538,7 +538,8 @@ class MediaIntelligence:
         truncated_by_duration = duration > _ANALYSIS_SECONDS_LIMIT
         scene_filter = f"select='gt(scene,{threshold:.3f})',metadata=print:file=-"
         scene_cmd = [
-            self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(source),
+            self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+            "-t", f"{analyzed_duration:.6f}", "-i", str(source),
             "-map", "0:v:0", "-vf",
             f"setpts=PTS-STARTPTS,trim=duration={analyzed_duration:.6f},{scene_filter}",
             "-an", "-sn", "-dn", "-f", "null", "-",
@@ -578,7 +579,8 @@ class MediaIntelligence:
                 "scale=640:360:force_original_aspect_ratio=decrease"
             )
             frame_cmd = [
-                self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(source),
+                self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+                "-t", f"{analyzed_duration:.6f}", "-i", str(source),
                 "-map", "0:v:0", "-vf", frame_filter, "-an", "-sn", "-dn",
                 "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",
                 "-f", "image2", "-start_number", "0", pattern,
