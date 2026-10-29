@@ -11,7 +11,8 @@ to a remote service.
   stream dimensions, rational frame rate, pixel format, color metadata, audio
   sample rate and channel count, and a small allowlist of descriptive tags.
 - FFmpeg scene-score boundary candidates with timestamp and score. The first
-  frame is also included as a navigation point.
+  frame is also included as a navigation point. Timestamps retain the source
+  video's stream start time, including when an audio track begins earlier.
 - JPEG keyframes extracted from the decoded boundary frames at up to 640x360.
 - A local metadata search over filenames, probe fields, and saved scene times.
 
@@ -30,7 +31,9 @@ Each operation is bounded to 120 seconds, examines at most the first 600 seconds
 of a source, accepts scene thresholds from 0.05 through 0.95, records up to 24
 scene boundaries selected across the analyzed duration plus the opening frame,
 caps each keyframe at 2 MiB and total analysis keyframes at 80 MiB. Results
-report whether the duration or scene list was truncated.
+report whether the duration or scene list was truncated. FFprobe and FFmpeg
+stdout/stderr are captured with fixed byte limits while the child is running;
+an over-limit process is stopped instead of buffering unbounded output.
 
 Scene scores are candidate boundaries, not a semantic description of what a
 shot depicts. P3-03 does not generate captions or transcript text. `whisper-cli`

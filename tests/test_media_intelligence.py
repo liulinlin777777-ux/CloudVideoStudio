@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,6 +18,8 @@ from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.media_intelligence import (
     MediaAnalysisError,
     MediaIntelligence,
+    _OutputLimitExceeded,
+    _bounded_subprocess,
     _select_scene_candidates,
     get_analysis,
     keyframe_path,
@@ -106,6 +109,17 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertNotEqual(second["analysis_id"], first["analysis_id"])
         self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
 
+    def test_previous_cache_schema_is_reanalyzed(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        data["schema_version"] = 2
+        cache.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        second = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertNotEqual(second["analysis_id"], first["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
+
     def test_missing_keyframe_cache_is_reanalyzed(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
         (self.store.root / "derivatives" / first["keyframes"][0]).unlink()
@@ -164,13 +178,45 @@ class MediaIntelligenceTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, stdout, "")
 
         with patch.object(media_module.time, "monotonic", side_effect=lambda: clock[0]), \
-                patch.object(media_module.subprocess, "run", side_effect=run):
+                patch.object(media_module, "_bounded_subprocess", side_effect=run):
             self.analyzer._probe(self.source, deadline=10.0)
             clock[0] = 3.0
             self.analyzer._run(["ffmpeg", "scene"], "scene detection", deadline=10.0)
             clock[0] = 6.0
             self.analyzer._version("ffmpeg", deadline=10.0)
         self.assertEqual(calls, [10.0, 7.0, 4.0])
+
+    def test_subprocess_output_is_bounded_while_being_read(self):
+        for fd, channel in ((1, "stdout"), (2, "stderr")):
+            command = [sys.executable, "-c", f"import os\nwhile True: os.write({fd}, b'x' * 65536)"]
+            with self.subTest(channel=channel), self.assertRaisesRegex(_OutputLimitExceeded, channel):
+                _bounded_subprocess(command, timeout=5, stdout_limit=128, stderr_limit=128)
+
+    def test_video_scene_times_keep_nonzero_stream_origin(self):
+        clip = self.root / "offset-scenes.mp4"
+        delayed = self.root / "delayed-video-with-audio.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=96x64:r=10:d=1",
+            "-f", "lavfi", "-i", "color=c=white:s=96x64:r=10:d=1",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p[v]",
+            "-map", "[v]", "-c:v", "libx264", "-preset", "ultrafast", str(clip),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, check=True)
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+            "-itsoffset", "5", "-i", str(clip), "-map", "1:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-avoid_negative_ts", "disabled", str(delayed),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, check=True)
+        delayed_asset = self.store.import_file(delayed)
+        with patch.object(media_module, "_ANALYSIS_SECONDS_LIMIT", 1.5):
+            result = self.analyzer.analyze(delayed_asset["id"], scene_threshold=0.20)
+        self.assertGreaterEqual(result["scenes"][0]["start_seconds"], 4.9)
+        self.assertEqual(len(result["scenes"]), 2)
+        self.assertAlmostEqual(result["scenes"][1]["start_seconds"], 6.0, delta=0.15)
+        self.assertEqual(len(result["keyframes"]), 2)
 
     def test_reanalysis_reserves_replacement_instead_of_double_counting_frames(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
@@ -240,6 +286,17 @@ class MediaIntelligenceTests(unittest.TestCase):
         linked = self.store.relink(self.asset["id"], alternate, filename="alternate.mp4")
         self.assertNotEqual(linked["sha256"], first["source_sha256"])
         self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+
+    def test_cached_analysis_and_keyframes_reject_modified_managed_bytes(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertEqual(search_assets(self.store, "candidate_count")[0]["id"], self.asset["id"])
+        managed = self.store.root / self.asset["path"]
+        managed.write_bytes(managed.read_bytes() + b"tampered")
+        with self.assertRaisesRegex(ValueError, "failed its content hash"):
+            get_analysis(self.store, self.asset["id"])
+        with self.assertRaisesRegex(ValueError, "failed its content hash"):
+            read_keyframe(self.store, self.asset["id"], 0, analysis_id=result["analysis_id"])
+        self.assertEqual(search_assets(self.store, "candidate_count"), [])
 
     def test_same_bytes_relink_refreshes_cached_filename_metadata(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)

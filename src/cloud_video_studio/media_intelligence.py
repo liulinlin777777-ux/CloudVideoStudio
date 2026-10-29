@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
 import subprocess
 import tempfile
@@ -21,7 +22,7 @@ import time
 import uuid
 from typing import Any
 
-from .assets import AssetStore
+from .assets import AssetStore, _hash_file
 
 
 _ASSET_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -29,7 +30,7 @@ _SCENE_LINE = re.compile(
     r"frame:\s*\d+\s+pts:\s*(?P<pts>-?\d+)\s+pts_time:(?P<time>-?\d+(?:\.\d+)?)\s*\n"
     r"lavfi\.scene_score=(?P<score>\d+(?:\.\d+)?)"
 )
-_CACHE_SCHEMA = 2
+_CACHE_SCHEMA = 3
 _CACHE_BYTES_LIMIT = 1024 * 1024
 _KEYFRAME_BYTES_LIMIT = 2 * 1024 * 1024
 _KEYFRAME_COUNT_LIMIT = 25
@@ -37,6 +38,91 @@ _SCENE_COUNT_LIMIT = 24
 _ANALYSIS_SECONDS_LIMIT = 600.0
 _ANALYSIS_OUTPUT_LIMIT = 80 * 1024 * 1024
 _TAG_KEYS = ("title", "artist", "date", "encoder")
+
+
+class _OutputLimitExceeded(Exception):
+    """A child process exceeded a bounded stdout or stderr allowance."""
+
+
+def _bounded_subprocess(
+    command: list[str], *, timeout: float, stdout_limit: int, stderr_limit: int,
+) -> subprocess.CompletedProcess[str]:
+    """Capture bounded child output and terminate the child as soon as it overflows."""
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    exceeded: str | None = None
+    exceeded_at: float | None = None
+    timed_out = False
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    try:
+        for name, stream in streams.items():
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map() or process.poll() is None:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0 and not timed_out and process.poll() is None:
+                timed_out = True
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            if (exceeded_at is not None and process.poll() is None
+                    and time.monotonic() - exceeded_at >= 0.25):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            events = selector.select(max(0.0, min(0.05, remaining))) if selector.get_map() else []
+            for key, _ in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                name = key.data
+                captured = buffers[name]
+                allowance = limits[name] + 1 - len(captured)
+                if allowance > 0:
+                    captured.extend(chunk[:allowance])
+                if len(captured) > limits[name] and exceeded is None:
+                    exceeded = name
+                    exceeded_at = time.monotonic()
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+        process.wait()
+    finally:
+        selector.close()
+        for stream in streams.values():
+            if not stream.closed:
+                stream.close()
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout)
+    if exceeded is not None:
+        raise _OutputLimitExceeded(exceeded)
+    return subprocess.CompletedProcess(
+        command, process.returncode,
+        buffers["stdout"].decode("utf-8", errors="replace"),
+        buffers["stderr"].decode("utf-8", errors="replace"),
+    )
 
 
 class MediaAnalysisError(ValueError):
@@ -53,6 +139,14 @@ def _finite_positive(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) and result > 0 else None
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _optional_positive_int(value: Any) -> int | None:
@@ -165,6 +259,19 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
     return data
 
 
+def _verify_managed_bytes_under_store_lock(store: AssetStore, record: dict[str, Any]) -> Path:
+    """Verify cached-analysis source bytes without reparsing media metadata."""
+    source = store._managed_path(record)
+    try:
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_size != record["size_bytes"]
+                or _hash_file(source) != record["sha256"]):
+            raise ValueError("managed asset is missing or failed its content hash")
+    except OSError as exc:
+        raise ValueError("managed asset is missing or failed its content hash") from exc
+    return source
+
+
 def _analysis_under_store_lock(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
     if not _ASSET_ID.fullmatch(asset_id):
         raise MediaAnalysisError("invalid asset id")
@@ -173,6 +280,7 @@ def _analysis_under_store_lock(store: AssetStore, asset_id: str) -> dict[str, An
         raise MediaAnalysisError("unknown asset id")
     if record["kind"] != "video":
         raise MediaAnalysisError("analysis is available for video assets only")
+    _verify_managed_bytes_under_store_lock(store, record)
     return _load_analysis(store, asset_id, record)
 
 
@@ -241,9 +349,11 @@ def search_assets(store: AssetStore, query: str) -> list[dict[str, Any]]:
             }
             if record.get("kind") == "video":
                 try:
-                    analysis = _load_analysis(store, record["id"], record)
-                except MediaAnalysisError:
+                    _verify_managed_bytes_under_store_lock(store, record)
+                except ValueError:
                     analysis = None
+                else:
+                    analysis = _load_analysis(store, record["id"], record)
                 if analysis:
                     searchable["analysis"] = {
                         "metadata": analysis.get("metadata"),
@@ -339,18 +449,21 @@ class MediaIntelligence:
         deadline = time.monotonic() + self.timeout
         probe = self._probe(source, deadline=deadline)
         metadata = self._metadata(record, probe)
+        video_stream = next(stream for stream in probe["streams"] if stream.get("codec_type") == "video")
+        source_time_origin = _finite_number(video_stream.get("start_time"))
+        if source_time_origin is None:
+            source_time_origin = _finite_number(probe["format"].get("start_time")) or 0.0
         duration = metadata["duration_seconds"]
         analyzed_duration = min(duration, _ANALYSIS_SECONDS_LIMIT)
         truncated_by_duration = duration > _ANALYSIS_SECONDS_LIMIT
         scene_filter = f"select='gt(scene,{threshold:.3f})',metadata=print:file=-"
         scene_cmd = [
             self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(source),
-            "-map", "0:v:0", "-vf", f"trim=duration={analyzed_duration:.6f},{scene_filter}",
+            "-map", "0:v:0", "-vf",
+            f"setpts=PTS-STARTPTS,trim=duration={analyzed_duration:.6f},{scene_filter}",
             "-an", "-sn", "-dn", "-f", "null", "-",
         ]
         scene_run = self._run(scene_cmd, "scene detection", deadline=deadline)
-        if len(scene_run.stdout) > 16 * 1024 * 1024:
-            raise MediaAnalysisError("scene analysis output exceeded its safety limit")
         detections = []
         seen_pts: set[int] = set()
         for match in _SCENE_LINE.finditer(scene_run.stdout):
@@ -380,7 +493,7 @@ class MediaIntelligence:
             selected_pts = "+".join(f"eq(pts,{item['pts']})" for item in selected)
             selection = "eq(n,0)" + (f"+{selected_pts}" if selected_pts else "")
             frame_filter = (
-                f"trim=duration={analyzed_duration:.6f},"
+                f"setpts=PTS-STARTPTS,trim=duration={analyzed_duration:.6f},"
                 f"select='{selection}',"
                 "scale=640:360:force_original_aspect_ratio=decrease"
             )
@@ -413,9 +526,10 @@ class MediaIntelligence:
             if total_image_bytes > _ANALYSIS_OUTPUT_LIMIT:
                 raise MediaAnalysisError("analysis keyframes exceeded their total size limit")
 
-            scenes = [{"index": 0, "start_seconds": 0.0, "score": None}]
+            scenes = [{"index": 0, "start_seconds": round(source_time_origin, 6), "score": None}]
             scenes.extend(
-                {"index": index + 1, **detection}
+                {"index": index + 1, **detection,
+                 "start_seconds": round(source_time_origin + detection["start_seconds"], 6)}
                 for index, detection in enumerate(selected)
             )
             result = {
@@ -511,13 +625,15 @@ class MediaIntelligence:
             self.ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source),
         ]
         try:
-            result = subprocess.run(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=min(self._remaining(deadline), 30), check=False,
+            result = _bounded_subprocess(
+                command, timeout=min(self._remaining(deadline), 30),
+                stdout_limit=4 * 1024 * 1024, stderr_limit=1024 * 1024,
             )
+        except _OutputLimitExceeded as exc:
+            raise MediaAnalysisError("FFPROBE_FAILED_OR_OUTPUT_LIMIT") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise MediaAnalysisError("FFPROBE_UNAVAILABLE_OR_TIMEOUT") from exc
-        if result.returncode or len(result.stdout) > 4 * 1024 * 1024:
+        if result.returncode:
             raise MediaAnalysisError("FFPROBE_FAILED_OR_OUTPUT_LIMIT")
         try:
             data = json.loads(result.stdout)
@@ -581,10 +697,12 @@ class MediaIntelligence:
 
     def _run(self, command: list[str], operation: str, *, deadline: float) -> subprocess.CompletedProcess[str]:
         try:
-            result = subprocess.run(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=self._remaining(deadline), check=False,
+            result = _bounded_subprocess(
+                command, timeout=self._remaining(deadline),
+                stdout_limit=16 * 1024 * 1024, stderr_limit=1024 * 1024,
             )
+        except _OutputLimitExceeded as exc:
+            raise MediaAnalysisError(f"{operation.upper().replace(' ', '_')}_OUTPUT_LIMIT") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise MediaAnalysisError(f"{operation.upper().replace(' ', '_')}_FAILED_OR_TIMEOUT") from exc
         if result.returncode:
@@ -594,12 +712,11 @@ class MediaIntelligence:
     def _version(self, executable: str, *, deadline: float) -> str:
         try:
             remaining = self._remaining(deadline)
-            result = subprocess.run(
-                [executable, "-version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                timeout=min(5, remaining), check=False,
+            result = _bounded_subprocess(
+                [executable, "-version"], timeout=min(5, remaining),
+                stdout_limit=64 * 1024, stderr_limit=64 * 1024,
             )
-        except (OSError, subprocess.TimeoutExpired, MediaAnalysisError):
+        except (OSError, subprocess.TimeoutExpired, MediaAnalysisError, _OutputLimitExceeded):
             return "unavailable"
         if result.returncode:
             return "unavailable"
