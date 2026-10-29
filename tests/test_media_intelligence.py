@@ -7,7 +7,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import cloud_video_studio.assets as assets_module
 from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.media_intelligence import (
     MediaAnalysisError,
@@ -79,8 +81,58 @@ class MediaIntelligenceTests(unittest.TestCase):
         repeated = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=8)
         self.assertEqual(repeated["analysis_id"], result["analysis_id"])
         self.assertEqual(search_assets(self.store, "three-scene-clip")[0]["id"], self.asset["id"])
+        self.assertEqual(search_assets(self.store, str(self.asset["size_bytes"]))[0]["id"], self.asset["id"])
         self.assertEqual(search_assets(self.store, "h264")[0]["id"], self.asset["id"])
         self.assertEqual(search_assets(self.store, "not-present"), [])
+
+    def test_corrupt_cache_is_reanalyzed(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        cache.write_text("{", encoding="utf-8")
+        second = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertNotEqual(second["analysis_id"], first["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
+
+    def test_missing_keyframe_cache_is_reanalyzed(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        (self.store.root / "derivatives" / first["keyframes"][0]).unlink()
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        second = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertNotEqual(second["analysis_id"], first["analysis_id"])
+        self.assertTrue(all(keyframe_path(self.store, self.asset["id"], i).is_file()
+                            for i in range(len(second["keyframes"]))))
+
+    def test_reanalysis_reserves_replacement_instead_of_double_counting_frames(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        directory = self.store.root / "derivatives"
+        cache = directory / f"{self.asset['id']}-analysis.json"
+        old_names = set(first["keyframes"])
+        old_frame_bytes = sum((directory / name).stat().st_size for name in old_names)
+        old_cache_bytes = cache.stat().st_size
+        used_before = sum(path.stat().st_size for path in directory.iterdir()
+                          if path.is_file() and not path.is_symlink())
+        original_limit = assets_module._DERIVATIVE_TOTAL_LIMIT
+        original_check = AssetStore._check_derivative_total
+        observed = []
+
+        def exact_replacement_check(store, *, replacing=None, additional_bytes=0):
+            observed.append((replacing, additional_bytes))
+            self.assertTrue(old_names.issubset(replacing))
+            self.assertIn(cache.name, replacing)
+            self.assertGreater(additional_bytes, 0)
+            assets_module._DERIVATIVE_TOTAL_LIMIT = (
+                used_before - old_frame_bytes - old_cache_bytes + additional_bytes
+            )
+            try:
+                return original_check(store, replacing=replacing, additional_bytes=additional_bytes)
+            finally:
+                assets_module._DERIVATIVE_TOTAL_LIMIT = original_limit
+
+        with patch.object(AssetStore, "_check_derivative_total", exact_replacement_check):
+            second = self.analyzer.analyze(self.asset["id"], scene_threshold=0.25)
+        self.assertNotEqual(second["analysis_id"], first["analysis_id"])
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
 
     def test_scene_count_is_bounded_and_reports_truncation(self):
         result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=1)

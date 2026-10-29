@@ -263,12 +263,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not analysis_lock.acquire(blocking=False):
                     return self.reply(409, {'error': 'ANALYSIS_BUSY'})
                 try:
-                    with asset_lock:
-                        result = media_intelligence.analyze(
-                            analysis_match.group(1),
-                            scene_threshold=data.get('scene_threshold', 0.35),
-                            max_scenes=data.get('max_scenes', 24),
-                        )
+                    result = media_intelligence.analyze(
+                        analysis_match.group(1),
+                        scene_threshold=data.get('scene_threshold', 0.35),
+                        max_scenes=data.get('max_scenes', 24),
+                        publication_lock=asset_lock,
+                    )
                     return self.reply(200, {key: value for key, value in result.items() if key != 'keyframes'})
                 finally:
                     analysis_lock.release()

@@ -11,6 +11,7 @@ class PreviewContract(unittest.TestCase):
   cls.tmp=tempfile.TemporaryDirectory();cls.root=Path(cls.tmp.name);cls.port=18774
   with patch.object(sys,'argv',['preview_server.py','--media-root',str(cls.root),'--port',str(cls.port)]),patch('http.server.ThreadingHTTPServer'):
    module=runpy.run_path('tools/preview_server.py',run_name='preview_contract')
+  cls.server_globals=module
   cls.handler=module['Handler']
  @classmethod
  def tearDownClass(cls):cls.tmp.cleanup()
@@ -85,3 +86,14 @@ class PreviewContract(unittest.TestCase):
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin='https://evil.example')[0],403)
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin=f'http://127.0.0.1:{self.port}')[0],400)
   self.assertIn(self.request(f'/assets/{asset_id}/keyframes/0')[0],[400,404])
+ def test_media_analysis_does_not_hold_asset_lock_during_decode(self):
+  from unittest.mock import patch
+  lock=self.server_globals['asset_lock']; analyzer=self.server_globals['media_intelligence']
+  def fake_analyze(asset_id,**kwargs):
+   self.assertFalse(lock._is_owned())
+   self.assertIs(kwargs['publication_lock'],lock)
+   return {'keyframes':[],'scenes':[],'scene_detection':{'candidate_count':0}}
+  with patch.object(analyzer,'analyze',side_effect=fake_analyze):
+   code,body=self.request('/assets/'+('a'*32)+'/analyze',{'scene_threshold':0.35},
+                          origin=f'http://127.0.0.1:{self.port}')
+  self.assertEqual(code,200,body)

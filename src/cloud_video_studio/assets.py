@@ -285,10 +285,22 @@ class AssetStore:
             raise ValueError("asset derivative storage limit exceeded")
         return min(per_file_limit, available)
 
-    def _check_derivative_total(self) -> None:
+    def _check_derivative_total(
+        self,
+        *,
+        replacing: set[str] | None = None,
+        additional_bytes: int = 0,
+    ) -> None:
+        if (isinstance(additional_bytes, bool) or not isinstance(additional_bytes, int)
+                or additional_bytes < 0):
+            raise ValueError("invalid derivative size reservation")
+        excluded = replacing or set()
+        if (not isinstance(excluded, set)
+                or any(not isinstance(name, str) or Path(name).name != name for name in excluded)):
+            raise ValueError("invalid derivative replacement list")
         used = sum(path.stat().st_size for path in (self.root / "derivatives").iterdir()
-                   if path.is_file() and not path.is_symlink())
-        if used > _DERIVATIVE_TOTAL_LIMIT:
+                   if path.is_file() and not path.is_symlink() and path.name not in excluded)
+        if used + additional_bytes > _DERIVATIVE_TOTAL_LIMIT:
             raise ValueError("asset derivative storage limit exceeded")
 
     @staticmethod

@@ -6,6 +6,7 @@ and FFprobe binaries. It does not upload footage or infer speech transcripts.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from fractions import Fraction
 import json
@@ -13,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -38,6 +40,10 @@ _TAG_KEYS = ("title", "artist", "date", "encoder")
 
 class MediaAnalysisError(ValueError):
     """A bounded media analysis failed or its result was invalid."""
+
+
+def _cache_payload(data: dict[str, Any]) -> bytes:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _finite_positive(value: Any) -> float | None:
@@ -116,12 +122,12 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
         return None
     except OSError as exc:
         raise MediaAnalysisError("analysis cache is unavailable") from exc
-    if not path.is_file() or info.st_nlink != 1 or info.st_size <= 0 or info.st_size > _CACHE_BYTES_LIMIT:
-        raise MediaAnalysisError("analysis cache is invalid")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0 or info.st_size > _CACHE_BYTES_LIMIT:
+        return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MediaAnalysisError("analysis cache is invalid") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
     if (not isinstance(data, dict) or data.get("schema_version") != _CACHE_SCHEMA
             or data.get("asset_id") != asset_id or data.get("source_sha256") != record.get("sha256")
             or not isinstance(data.get("scenes"), list) or not isinstance(data.get("metadata"), dict)
@@ -129,26 +135,30 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
         return None
     keyframes = data.get("keyframes")
     if not isinstance(keyframes, list) or not 1 <= len(keyframes) <= _KEYFRAME_COUNT_LIMIT:
-        raise MediaAnalysisError("analysis keyframe index is invalid")
+        return None
     run_id = data.get("analysis_id")
     if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{12}", run_id):
-        raise MediaAnalysisError("analysis keyframe index is invalid")
+        return None
     if len(data["scenes"]) != len(keyframes):
-        raise MediaAnalysisError("analysis scene index is invalid")
+        return None
     for index, name in enumerate(keyframes):
         expected = f"{asset_id}-analysis-{run_id}-{index:03d}.jpg"
         image = path.parent / expected
         if name != expected:
-            raise MediaAnalysisError("analysis keyframe index is invalid")
+            return None
         try:
             image_info = image.lstat()
-        except OSError as exc:
-            raise MediaAnalysisError("analysis keyframe is unavailable") from exc
-        if image.is_symlink() or not image.is_file() or image_info.st_nlink != 1 or not 3 <= image_info.st_size <= _KEYFRAME_BYTES_LIMIT:
-            raise MediaAnalysisError("analysis keyframe is invalid")
-        with image.open("rb") as stream:
-            if stream.read(3) != b"\xff\xd8\xff":
-                raise MediaAnalysisError("analysis keyframe is invalid")
+        except OSError:
+            return None
+        if (not stat.S_ISREG(image_info.st_mode) or image.is_symlink() or image_info.st_nlink != 1
+                or not 3 <= image_info.st_size <= _KEYFRAME_BYTES_LIMIT):
+            return None
+        try:
+            with image.open("rb") as stream:
+                if stream.read(3) != b"\xff\xd8\xff":
+                    return None
+        except OSError:
+            return None
     return data
 
 
@@ -190,6 +200,7 @@ def search_assets(store: AssetStore, query: str) -> list[dict[str, Any]]:
         searchable: dict[str, Any] = {
             "filename": record.get("filename"),
             "kind": record.get("kind"),
+            "size_bytes": record.get("size_bytes"),
             "metadata": record.get("metadata"),
         }
         if record.get("kind") == "video":
@@ -265,6 +276,7 @@ class MediaIntelligence:
         *,
         scene_threshold: float = 0.35,
         max_scenes: int = _SCENE_COUNT_LIMIT,
+        publication_lock: Any = None,
     ) -> dict[str, Any]:
         if not _ASSET_ID.fullmatch(asset_id):
             raise MediaAnalysisError("invalid asset id")
@@ -315,47 +327,46 @@ class MediaIntelligence:
         analysis_id = uuid.uuid4().hex[:12]
         directory = _derivatives_dir(self.store)
         new_keyframes: list[str] = []
+        cache_committed = False
+        temporary_dir_context = tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=directory)
         try:
-            with tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=directory) as temporary_dir:
-                pattern = str(Path(temporary_dir) / "frame-%03d.jpg")
-                selected_pts = "+".join(f"eq(pts,{item['pts']})" for item in selected)
-                selection = "eq(n,0)" + (f"+{selected_pts}" if selected_pts else "")
-                frame_filter = (
-                    f"trim=duration={analyzed_duration:.6f},"
-                    f"select='{selection}',"
-                    "scale=640:360:force_original_aspect_ratio=decrease"
-                )
-                frame_cmd = [
-                    self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(source),
-                    "-map", "0:v:0", "-vf", frame_filter, "-an", "-sn", "-dn",
-                    "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",
-                    "-f", "image2", "-start_number", "0", pattern,
-                ]
-                self._run(frame_cmd, "keyframe extraction")
-                images = sorted(Path(temporary_dir).glob("frame-*.jpg"))
-                if len(images) != output_count:
-                    raise MediaAnalysisError("keyframe count did not match detected scene boundaries")
-                total_image_bytes = 0
-                for index, image in enumerate(images):
-                    info = image.lstat()
-                    if image.is_symlink() or not image.is_file() or info.st_nlink != 1 or not 3 <= info.st_size <= _KEYFRAME_BYTES_LIMIT:
-                        raise MediaAnalysisError("keyframe output is invalid or exceeds its per-frame limit")
-                    with image.open("rb") as stream:
-                        if stream.read(3) != b"\xff\xd8\xff":
-                            raise MediaAnalysisError("keyframe output is not a JPEG")
-                    total_image_bytes += info.st_size
-                    name = f"{asset_id}-analysis-{analysis_id}-{index:03d}.jpg"
-                    target = directory / name
-                    if target.exists() or target.is_symlink():
-                        raise MediaAnalysisError("keyframe destination already exists")
-                    os.replace(image, target)
-                    new_keyframes.append(name)
-                if total_image_bytes > _ANALYSIS_OUTPUT_LIMIT:
-                    raise MediaAnalysisError("analysis keyframes exceeded their total size limit")
-
-            after, _ = self.store.verified_asset(asset_id, kind="video")
-            if after.get("sha256") != record.get("sha256") or after.get("path") != record.get("path"):
-                raise MediaAnalysisError("video asset changed during analysis")
+            temporary_dir = temporary_dir_context.name
+            pattern = str(Path(temporary_dir) / "frame-%03d.jpg")
+            selected_pts = "+".join(f"eq(pts,{item['pts']})" for item in selected)
+            selection = "eq(n,0)" + (f"+{selected_pts}" if selected_pts else "")
+            frame_filter = (
+                f"trim=duration={analyzed_duration:.6f},"
+                f"select='{selection}',"
+                "scale=640:360:force_original_aspect_ratio=decrease"
+            )
+            frame_cmd = [
+                self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(source),
+                "-map", "0:v:0", "-vf", frame_filter, "-an", "-sn", "-dn",
+                "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",
+                "-f", "image2", "-start_number", "0", pattern,
+            ]
+            self._run(frame_cmd, "keyframe extraction")
+            images = sorted(Path(temporary_dir).glob("frame-*.jpg"))
+            if len(images) != output_count:
+                raise MediaAnalysisError("keyframe count did not match detected scene boundaries")
+            total_image_bytes = 0
+            prepared_images: list[tuple[Path, str]] = []
+            for index, image in enumerate(images):
+                info = image.lstat()
+                if (not stat.S_ISREG(info.st_mode) or image.is_symlink() or info.st_nlink != 1
+                        or not 3 <= info.st_size <= _KEYFRAME_BYTES_LIMIT):
+                    raise MediaAnalysisError("keyframe output is invalid or exceeds its per-frame limit")
+                with image.open("rb") as stream:
+                    if stream.read(3) != b"\xff\xd8\xff":
+                        raise MediaAnalysisError("keyframe output is not a JPEG")
+                total_image_bytes += info.st_size
+                name = f"{asset_id}-analysis-{analysis_id}-{index:03d}.jpg"
+                target = directory / name
+                if target.exists() or target.is_symlink():
+                    raise MediaAnalysisError("keyframe destination already exists")
+                prepared_images.append((image, name))
+            if total_image_bytes > _ANALYSIS_OUTPUT_LIMIT:
+                raise MediaAnalysisError("analysis keyframes exceeded their total size limit")
 
             scenes = [{"index": 0, "start_seconds": 0.0, "score": None}]
             scenes.extend(
@@ -380,16 +391,55 @@ class MediaIntelligence:
                     "truncated": scene_detection_truncated,
                 },
                 "scenes": scenes,
-                "keyframes": new_keyframes,
+                "keyframes": [name for _, name in prepared_images],
             }
-            self.store._check_derivative_total()
-            self._write_cache(asset_id, result)
-            self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
+            encoded_cache_size = len(_cache_payload(result))
+            publication = publication_lock if publication_lock is not None else self.store._lock
+            with publication:
+                after, _ = self.store.verified_asset(asset_id, kind="video")
+                if after.get("sha256") != record.get("sha256") or after.get("path") != record.get("path"):
+                    raise MediaAnalysisError("video asset changed during analysis")
+                replacement_names = self._replaceable_analysis_files(directory, asset_id)
+                cache_path = _cache_path(self.store, asset_id)
+                try:
+                    cache_info = cache_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISREG(cache_info.st_mode) and cache_info.st_nlink == 1:
+                        replacement_names.add(cache_path.name)
+                self.store._check_derivative_total(
+                    replacing=replacement_names,
+                    additional_bytes=total_image_bytes + encoded_cache_size,
+                )
+                for image, name in prepared_images:
+                    os.replace(image, directory / name)
+                    new_keyframes.append(name)
+                self._write_cache(asset_id, result)
+                cache_committed = True
+                self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
             return result
         except BaseException:
-            for name in new_keyframes:
-                (directory / name).unlink(missing_ok=True)
+            if not cache_committed:
+                for name in new_keyframes:
+                    (directory / name).unlink(missing_ok=True)
             raise
+        finally:
+            temporary_dir_context.cleanup()
+
+    @staticmethod
+    def _replaceable_analysis_files(directory: Path, asset_id: str) -> set[str]:
+        """Find this asset's replaceable regular keyframes, excluding aliases."""
+        prefix = f"{asset_id}-analysis-"
+        replaceable: set[str] = set()
+        for path in directory.glob(f"{prefix}*.jpg"):
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                replaceable.add(path.name)
+        return replaceable
 
     def _probe(self, source: Path) -> dict[str, Any]:
         command = [
@@ -492,7 +542,7 @@ class MediaIntelligence:
 
     def _write_cache(self, asset_id: str, data: dict[str, Any]) -> None:
         target = _cache_path(self.store, asset_id)
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        payload = _cache_payload(data)
         if not payload or len(payload) > _CACHE_BYTES_LIMIT:
             raise MediaAnalysisError("analysis cache exceeded its safety limit")
         fd, temporary_name = tempfile.mkstemp(prefix=f".{asset_id}-analysis-", dir=target.parent)
