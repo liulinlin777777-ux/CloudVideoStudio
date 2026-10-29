@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 from typing import Any
 
@@ -164,11 +165,10 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
     return data
 
 
-def get_analysis(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
-    """Return cached analysis only when its digest still matches the manifest."""
+def _analysis_under_store_lock(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
     if not _ASSET_ID.fullmatch(asset_id):
         raise MediaAnalysisError("invalid asset id")
-    record = next((item for item in store.list_assets() if item["id"] == asset_id), None)
+    record = next((item for item in store._read_manifest() if item["id"] == asset_id), None)
     if record is None:
         raise MediaAnalysisError("unknown asset id")
     if record["kind"] != "video":
@@ -176,53 +176,87 @@ def get_analysis(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
     return _load_analysis(store, asset_id, record)
 
 
-def keyframe_path(store: AssetStore, asset_id: str, index: int) -> Path:
-    """Resolve a numeric keyframe index through the validated analysis record."""
+def get_analysis(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
+    """Read a complete cache snapshot while relinks and analysis publication are excluded."""
+    if not _ASSET_ID.fullmatch(asset_id):
+        raise MediaAnalysisError("invalid asset id")
+    with store._lock, store._process_lock():
+        return _analysis_under_store_lock(store, asset_id)
+
+
+def _keyframe_path_under_store_lock(
+    store: AssetStore, asset_id: str, index: int, analysis_id: str | None,
+) -> Path:
     if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < _KEYFRAME_COUNT_LIMIT:
         raise MediaAnalysisError("invalid keyframe index")
-    analysis = get_analysis(store, asset_id)
+    if analysis_id is not None and (not isinstance(analysis_id, str)
+                                    or not re.fullmatch(r"[0-9a-f]{12}", analysis_id)):
+        raise MediaAnalysisError("invalid analysis id")
+    analysis = _analysis_under_store_lock(store, asset_id)
     if analysis is None or index >= len(analysis["keyframes"]):
         raise MediaAnalysisError("keyframe not found")
+    if analysis_id is not None and analysis["analysis_id"] != analysis_id:
+        raise MediaAnalysisError("analysis changed; reload the scene list")
     path = _derivatives_dir(store) / analysis["keyframes"][index]
     if path.is_symlink() or not path.is_file():
         raise MediaAnalysisError("keyframe not found")
     return path
 
 
+def keyframe_path(
+    store: AssetStore, asset_id: str, index: int, *, analysis_id: str | None = None,
+) -> Path:
+    """Resolve a scene frame; callers serving bytes should use read_keyframe instead."""
+    with store._lock, store._process_lock():
+        return _keyframe_path_under_store_lock(store, asset_id, index, analysis_id)
+
+
+def read_keyframe(store: AssetStore, asset_id: str, index: int, *, analysis_id: str) -> bytes:
+    """Validate and read a frame atomically against its analysis cache version."""
+    with store._lock, store._process_lock():
+        path = _keyframe_path_under_store_lock(store, asset_id, index, analysis_id)
+        with path.open("rb") as stream:
+            data = stream.read(_KEYFRAME_BYTES_LIMIT + 1)
+        if not 3 <= len(data) <= _KEYFRAME_BYTES_LIMIT or data[:3] != b"\xff\xd8\xff":
+            raise MediaAnalysisError("keyframe is unavailable")
+        return data
+
+
 def search_assets(store: AssetStore, query: str) -> list[dict[str, Any]]:
-    """Search only the local manifest and cached analysis fields."""
+    """Search manifest and analysis snapshots while cross-process mutation is excluded."""
     if not isinstance(query, str) or len(query) > 120 or any(ord(char) < 32 for char in query):
         raise MediaAnalysisError("invalid search query")
     needle = " ".join(query.split()).casefold()
-    records = store.list_assets()
-    if not needle:
-        return records
-    found: list[dict[str, Any]] = []
-    for record in records:
-        searchable: dict[str, Any] = {
-            "filename": record.get("filename"),
-            "kind": record.get("kind"),
-            "size_bytes": record.get("size_bytes"),
-            "metadata": record.get("metadata"),
-        }
-        if record.get("kind") == "video":
+    with store._lock, store._process_lock():
+        records = store._read_manifest()
+        if not needle:
+            return [dict(item) for item in records]
+        found: list[dict[str, Any]] = []
+        for record in records:
+            searchable: dict[str, Any] = {
+                "filename": record.get("filename"),
+                "kind": record.get("kind"),
+                "size_bytes": record.get("size_bytes"),
+                "metadata": record.get("metadata"),
+            }
+            if record.get("kind") == "video":
+                try:
+                    analysis = _load_analysis(store, record["id"], record)
+                except MediaAnalysisError:
+                    analysis = None
+                if analysis:
+                    searchable["analysis"] = {
+                        "metadata": analysis.get("metadata"),
+                        "scenes": analysis.get("scenes"),
+                        "scene_detection": analysis.get("scene_detection"),
+                    }
             try:
-                analysis = _load_analysis(store, record["id"], record)
-            except MediaAnalysisError:
-                analysis = None
-            if analysis:
-                searchable["analysis"] = {
-                    "metadata": analysis.get("metadata"),
-                    "scenes": analysis.get("scenes"),
-                    "scene_detection": analysis.get("scene_detection"),
-                }
-        try:
-            haystack = json.dumps(searchable, ensure_ascii=False, sort_keys=True).casefold()
-        except (TypeError, ValueError):
-            continue
-        if needle in haystack:
-            found.append(dict(record))
-    return found
+                haystack = json.dumps(searchable, ensure_ascii=False, sort_keys=True).casefold()
+            except (TypeError, ValueError):
+                continue
+            if needle in haystack:
+                found.append(dict(record))
+        return found
 
 
 def _select_scene_candidates(
@@ -288,8 +322,9 @@ class MediaIntelligence:
         if isinstance(max_scenes, bool) or not isinstance(max_scenes, int) or not 1 <= max_scenes <= _SCENE_COUNT_LIMIT:
             raise MediaAnalysisError(f"max scenes must be between 1 and {_SCENE_COUNT_LIMIT}")
         threshold = round(float(scene_threshold), 3)
-        record, source = self.store.verified_asset(asset_id, kind="video")
-        cached = _load_analysis(self.store, asset_id, record)
+        with self.store._lock, self.store._process_lock():
+            record, source = self._verified_asset_under_store_lock(asset_id)
+            cached = _load_analysis(self.store, asset_id, record)
         if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
                 and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
             publication = publication_lock if publication_lock is not None else self.store._lock
@@ -301,7 +336,8 @@ class MediaIntelligence:
                             and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
                         return cached
 
-        probe = self._probe(source)
+        deadline = time.monotonic() + self.timeout
+        probe = self._probe(source, deadline=deadline)
         metadata = self._metadata(record, probe)
         duration = metadata["duration_seconds"]
         analyzed_duration = min(duration, _ANALYSIS_SECONDS_LIMIT)
@@ -312,7 +348,7 @@ class MediaIntelligence:
             "-map", "0:v:0", "-vf", f"trim=duration={analyzed_duration:.6f},{scene_filter}",
             "-an", "-sn", "-dn", "-f", "null", "-",
         ]
-        scene_run = self._run(scene_cmd, "scene detection")
+        scene_run = self._run(scene_cmd, "scene detection", deadline=deadline)
         if len(scene_run.stdout) > 16 * 1024 * 1024:
             raise MediaAnalysisError("scene analysis output exceeded its safety limit")
         detections = []
@@ -354,7 +390,7 @@ class MediaIntelligence:
                 "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",
                 "-f", "image2", "-start_number", "0", pattern,
             ]
-            self._run(frame_cmd, "keyframe extraction")
+            self._run(frame_cmd, "keyframe extraction", deadline=deadline)
             images = sorted(Path(temporary_dir).glob("frame-*.jpg"))
             if len(images) != output_count:
                 raise MediaAnalysisError("keyframe count did not match detected scene boundaries")
@@ -388,7 +424,10 @@ class MediaIntelligence:
                 "analysis_id": analysis_id,
                 "source_sha256": record["sha256"],
                 "analyzed_at": datetime.now(timezone.utc).isoformat(),
-                "tool_versions": {"ffmpeg": self._version(self.ffmpeg), "ffprobe": self._version(self.ffprobe)},
+                "tool_versions": {
+                    "ffmpeg": self._version(self.ffmpeg, deadline=deadline),
+                    "ffprobe": self._version(self.ffprobe, deadline=deadline),
+                },
                 "metadata": metadata,
                 "duration_truncated": truncated_by_duration,
                 "analyzed_duration_seconds": round(analyzed_duration, 6),
@@ -460,14 +499,21 @@ class MediaIntelligence:
         self.store._verify_managed(source, record)
         return dict(record), source
 
-    def _probe(self, source: Path) -> dict[str, Any]:
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED")
+        return remaining
+
+    def _probe(self, source: Path, *, deadline: float) -> dict[str, Any]:
         command = [
             self.ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source),
         ]
         try:
             result = subprocess.run(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=min(self.timeout, 30), check=False,
+                timeout=min(self._remaining(deadline), 30), check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise MediaAnalysisError("FFPROBE_UNAVAILABLE_OR_TIMEOUT") from exc
@@ -533,11 +579,11 @@ class MediaIntelligence:
             "tags": clean_tags,
         }
 
-    def _run(self, command: list[str], operation: str) -> subprocess.CompletedProcess[str]:
+    def _run(self, command: list[str], operation: str, *, deadline: float) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=self.timeout, check=False,
+                text=True, encoding="utf-8", errors="replace", timeout=self._remaining(deadline), check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise MediaAnalysisError(f"{operation.upper().replace(' ', '_')}_FAILED_OR_TIMEOUT") from exc
@@ -545,15 +591,15 @@ class MediaIntelligence:
             raise MediaAnalysisError(f"{operation.upper().replace(' ', '_')}_FAILED")
         return result
 
-    @staticmethod
-    def _version(executable: str) -> str:
+    def _version(self, executable: str, *, deadline: float) -> str:
         try:
+            remaining = self._remaining(deadline)
             result = subprocess.run(
                 [executable, "-version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                timeout=5, check=False,
+                timeout=min(5, remaining), check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, MediaAnalysisError):
             return "unavailable"
         if result.returncode:
             return "unavailable"

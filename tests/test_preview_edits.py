@@ -81,11 +81,18 @@ class PreviewContract(unittest.TestCase):
   code,body=self.request('/assets/search?q=clip')
   self.assertEqual(code,200,body);self.assertEqual(body,{'assets':[]})
   self.assertEqual(self.request('/assets/search?q='+('x'*121))[0],400)
+  from unittest.mock import patch
   asset_id='a'*32
   body={'scene_threshold':0.35,'max_scenes':24}
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin='https://evil.example')[0],403)
   self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin=f'http://127.0.0.1:{self.port}')[0],400)
   self.assertIn(self.request(f'/assets/{asset_id}/keyframes/0')[0],[400,404])
+  self.assertEqual(self.request(f'/assets/{asset_id}/keyframes/0?analysis_id=not-a-version')[0],400)
+  with patch.dict(self.handler.do_GET.__globals__, {'read_keyframe': lambda store, requested_id, index, *, analysis_id:
+                                       b'\xff\xd8\xff' if (requested_id, index, analysis_id) ==
+                                       (asset_id, 0, 'a' * 12) else b'wrong'}):
+   code,body=self.request(f'/assets/{asset_id}/keyframes/0?analysis_id='+('a'*12))
+  self.assertEqual((code,body),(200,b'\xff\xd8\xff'))
  def test_media_analysis_does_not_hold_asset_lock_during_decode(self):
   from unittest.mock import patch
   lock=self.server_globals['asset_lock']; analyzer=self.server_globals['media_intelligence']

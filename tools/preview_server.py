@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cloud_video_studio.assets import AssetStore
-from cloud_video_studio.media_intelligence import MediaIntelligence, get_analysis, keyframe_path, search_assets
+from cloud_video_studio.media_intelligence import MediaIntelligence, get_analysis, read_keyframe, search_assets
 from cloud_video_studio.project import Project
 from cloud_video_studio.timeline_edits import (
     add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
@@ -154,9 +154,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {key: value for key, value in result.items() if key != 'keyframes'})
             keyframe_match = re.fullmatch(r'/assets/([0-9a-f]{32})/keyframes/(\d{1,2})', route)
             if keyframe_match:
+                values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
+                if (set(values) != {'analysis_id'} or len(values.get('analysis_id', [])) != 1
+                        or not re.fullmatch(r'[0-9a-f]{12}', values['analysis_id'][0])):
+                    return self.reply(400, {'error': 'INVALID_ANALYSIS_ID'})
                 with asset_lock:
-                    path = keyframe_path(asset_store, keyframe_match.group(1), int(keyframe_match.group(2)))
-                    return self.reply(200, path.read_bytes(), 'image/jpeg')
+                    data = read_keyframe(asset_store, keyframe_match.group(1), int(keyframe_match.group(2)),
+                                         analysis_id=values['analysis_id'][0])
+                return self.reply(200, data, 'image/jpeg')
             thumbnail_match = re.fullmatch(r'/assets/([0-9a-f]{32})/thumbnail', route)
             if thumbnail_match:
                 with asset_lock:

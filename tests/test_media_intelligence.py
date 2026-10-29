@@ -5,7 +5,9 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ from cloud_video_studio.media_intelligence import (
     _select_scene_candidates,
     get_analysis,
     keyframe_path,
+    read_keyframe,
     search_assets,
 )
 
@@ -65,7 +68,14 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertEqual([item["pts"] for item in selected], sorted(item["pts"] for item in selected))
 
     def test_real_ffmpeg_scene_detection_keyframes_and_cache(self):
-        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=8)
+        with patch.object(self.analyzer, "_probe", wraps=self.analyzer._probe) as probe_call, \
+                patch.object(self.analyzer, "_run", wraps=self.analyzer._run) as run_call, \
+                patch.object(self.analyzer, "_version", wraps=self.analyzer._version) as version_call:
+            result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=8)
+        deadlines = [probe_call.call_args.kwargs["deadline"]]
+        deadlines.extend(call.kwargs["deadline"] for call in run_call.call_args_list)
+        deadlines.extend(call.kwargs["deadline"] for call in version_call.call_args_list)
+        self.assertEqual(len(set(deadlines)), 1)
         self.assertEqual(result["metadata"]["container"].split(",")[0], "mov")
         self.assertEqual((result["metadata"]["width"], result["metadata"]["height"]), (96, 64))
         self.assertAlmostEqual(result["metadata"]["duration_seconds"], 3.0, delta=0.15)
@@ -76,6 +86,8 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(result["keyframes"]), 3)
         self.assertTrue(all(keyframe_path(self.store, self.asset["id"], index).is_file()
                             for index in range(3)))
+        frame = read_keyframe(self.store, self.asset["id"], 1, analysis_id=result["analysis_id"])
+        self.assertTrue(frame.startswith(b"\xff\xd8\xff"))
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.original_hash)
         cached = get_analysis(self.store, self.asset["id"])
         self.assertEqual(cached, result)
@@ -102,6 +114,63 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertNotEqual(second["analysis_id"], first["analysis_id"])
         self.assertTrue(all(keyframe_path(self.store, self.asset["id"], i).is_file()
                             for i in range(len(second["keyframes"]))))
+
+    def test_keyframe_request_rejects_a_stale_analysis_version(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        second = self.analyzer.analyze(self.asset["id"], scene_threshold=0.80)
+        self.assertNotEqual(first["analysis_id"], second["analysis_id"])
+        with self.assertRaisesRegex(MediaAnalysisError, "analysis changed"):
+            read_keyframe(self.store, self.asset["id"], 0, analysis_id=first["analysis_id"])
+
+    def test_analysis_cache_reads_are_inside_the_cross_process_lock(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        original_lock = self.store._process_lock
+        original_load = media_module._load_analysis
+        locked = False
+
+        @contextmanager
+        def tracked_process_lock():
+            nonlocal locked
+            with original_lock():
+                locked = True
+                try:
+                    yield
+                finally:
+                    locked = False
+
+        def checked_load(*args, **kwargs):
+            self.assertTrue(locked, "analysis cache was read without the shared store lock")
+            return original_load(*args, **kwargs)
+
+        with patch.object(self.store, "_process_lock", tracked_process_lock), \
+                patch.object(media_module, "_load_analysis", side_effect=checked_load):
+            self.assertEqual(get_analysis(self.store, self.asset["id"])["analysis_id"], result["analysis_id"])
+            self.assertTrue(read_keyframe(self.store, self.asset["id"], 0,
+                                          analysis_id=result["analysis_id"]).startswith(b"\xff\xd8\xff"))
+            self.assertEqual(search_assets(self.store, "three-scene-clip")[0]["id"], self.asset["id"])
+
+    def test_subprocess_timeout_uses_remaining_analysis_deadline(self):
+        clock = [0.0]
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(kwargs["timeout"])
+            if command[0] == "ffprobe":
+                stdout = json.dumps({"format": {}, "streams": [{"codec_type": "video"}]})
+            elif command[-1] == "-version":
+                stdout = "ffmpeg version test"
+            else:
+                stdout = ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        with patch.object(media_module.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(media_module.subprocess, "run", side_effect=run):
+            self.analyzer._probe(self.source, deadline=10.0)
+            clock[0] = 3.0
+            self.analyzer._run(["ffmpeg", "scene"], "scene detection", deadline=10.0)
+            clock[0] = 6.0
+            self.analyzer._version("ffmpeg", deadline=10.0)
+        self.assertEqual(calls, [10.0, 7.0, 4.0])
 
     def test_reanalysis_reserves_replacement_instead_of_double_counting_frames(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
@@ -194,17 +263,39 @@ class MediaIntelligenceTests(unittest.TestCase):
             timeout=30, check=True)
         original_load = media_module._load_analysis
         relinked = False
+        relink_errors = []
+        relink_thread = None
+
+        class WaitForRelink:
+            def __enter__(self):
+                relink_thread.join(timeout=5)
+                if relink_thread.is_alive():
+                    raise AssertionError("concurrent relink did not finish after cache read released the lock")
+                if relink_errors:
+                    raise relink_errors[0]
+                return self
+
+            def __exit__(self, *args):
+                return False
 
         def load_then_relink(store, asset_id, record):
-            nonlocal relinked
+            nonlocal relinked, relink_thread
             cached = original_load(store, asset_id, record)
             if not relinked:
                 relinked = True
-                store.relink(asset_id, alternate, filename="concurrent-relink.mp4")
+                def relink():
+                    try:
+                        store.relink(asset_id, alternate, filename="concurrent-relink.mp4")
+                    except BaseException as error:
+                        relink_errors.append(error)
+                relink_thread = threading.Thread(target=relink, daemon=True)
+                relink_thread.start()
             return cached
 
         with patch.object(media_module, "_load_analysis", side_effect=load_then_relink):
-            result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+            result = self.analyzer.analyze(
+                self.asset["id"], scene_threshold=0.20, publication_lock=WaitForRelink(),
+            )
         self.assertTrue(relinked)
         self.assertEqual(result["metadata"]["filename"], "concurrent-relink.mp4")
         self.assertEqual(result["source_sha256"], self.store.list_assets()[0]["sha256"])
