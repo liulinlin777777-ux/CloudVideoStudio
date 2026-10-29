@@ -41,7 +41,7 @@ async function analyzeAsset(asset,button){
   if(!assetIsCurrent(asset,generation)){const current=assetRows.find(item=>item.id===asset.id);if(current?.sha256===sourceSha)await refreshAssets();return}
   if(result.source_sha256!==sourceSha){await refreshAssets();status('Analysis result was discarded because the media changed.');return}
   asset.analysis=result;updateAssetAnalysisView(asset);status(`Analysis complete · ${result.scene_detection.candidate_count} detected boundaries · ${result.scenes.length} keyframes`)
- }catch(error){if(!assetIsCurrent(asset,generation))return;button.disabled=false;status(`Analysis failed: ${error.message}`,true)}
+ }catch(error){const current=assetRows.find(item=>item.id===asset.id);if(!current||current.sha256!==sourceSha)return;if(assetIsCurrent(asset,generation))button.disabled=false;else updateAssetAnalysisView(current);status(`Analysis failed: ${error.message}`,true)}
 }
 function drawAssetLibrary(){
  const library=$('asset-library');library.replaceChildren();
