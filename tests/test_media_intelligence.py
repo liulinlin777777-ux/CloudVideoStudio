@@ -163,6 +163,40 @@ class MediaIntelligenceTests(unittest.TestCase):
                                           analysis_id=result["analysis_id"]).startswith(b"\xff\xd8\xff"))
             self.assertEqual(search_assets(self.store, "three-scene-clip")[0]["id"], self.asset["id"])
 
+    def test_source_hash_is_amortized_across_keyframe_set_reads(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.store._media_verified_source_fingerprints.clear()
+        original_hash = media_module._hash_source_under_deadline
+        with patch.object(media_module, "_hash_source_under_deadline", wraps=original_hash) as hash_call:
+            self.assertEqual(get_analysis(self.store, self.asset["id"])["analysis_id"], result["analysis_id"])
+            for index in range(25):
+                frame = read_keyframe(
+                    self.store, self.asset["id"], index % len(result["keyframes"]),
+                    analysis_id=result["analysis_id"],
+                )
+                self.assertTrue(frame.startswith(b"\xff\xd8\xff"))
+            self.assertEqual(hash_call.call_count, 1)
+
+    def test_analysis_deadline_is_created_before_managed_file_validation(self):
+        captured = {}
+
+        def stop_validation(asset_id, *, deadline):
+            captured["asset_id"] = asset_id
+            captured["deadline"] = deadline
+            raise MediaAnalysisError("test validation stop")
+
+        with patch.object(media_module.time, "monotonic", return_value=50.0), \
+                patch.object(self.analyzer, "_verified_asset_under_store_lock", side_effect=stop_validation):
+            with self.assertRaisesRegex(MediaAnalysisError, "test validation stop"):
+                self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertEqual(captured["asset_id"], self.asset["id"])
+        self.assertEqual(captured["deadline"], 50.0 + self.analyzer.timeout)
+
+    def test_managed_source_hash_obeys_analysis_deadline(self):
+        with patch.object(media_module.time, "monotonic", return_value=11.0):
+            with self.assertRaisesRegex(MediaAnalysisError, "ANALYSIS_DEADLINE_EXCEEDED"):
+                media_module._hash_source_under_deadline(self.source, deadline=10.0)
+
     def test_subprocess_timeout_uses_remaining_analysis_deadline(self):
         clock = [0.0]
         calls = []

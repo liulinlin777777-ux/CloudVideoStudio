@@ -438,7 +438,9 @@ class AssetStore:
             "metadata_version": 1,
         }
 
-    def _inspect(self, source: Path, kind: str) -> dict[str, Any]:
+    def _inspect(
+        self, source: Path, kind: str, *, probe_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if kind == "subtitle":
             return _validate_srt(source, self.max_file_bytes)
         suffix = source.suffix.lower()
@@ -449,7 +451,7 @@ class AssetStore:
                 raise ValueError("file extension does not match PNG content")
             if suffix in {".jpg", ".jpeg"} and not header.startswith(b"\xff\xd8\xff"):
                 raise ValueError("file extension does not match JPEG content")
-        probe = _ffprobe(source)
+        probe = probe_data if probe_data is not None else _ffprobe(source)
         streams = probe.get("streams")
         if not isinstance(streams, list) or not streams:
             raise ValueError("FFprobe found no media streams")

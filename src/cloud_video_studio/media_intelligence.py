@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from fractions import Fraction
+import hashlib
 import json
 import math
 import os
@@ -22,7 +23,7 @@ import time
 import uuid
 from typing import Any
 
-from .assets import AssetStore, _hash_file
+from .assets import AssetStore
 
 
 _ASSET_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -37,6 +38,7 @@ _KEYFRAME_COUNT_LIMIT = 25
 _SCENE_COUNT_LIMIT = 24
 _ANALYSIS_SECONDS_LIMIT = 600.0
 _ANALYSIS_OUTPUT_LIMIT = 80 * 1024 * 1024
+_VERIFIED_SOURCE_CACHE_LIMIT = 256
 _TAG_KEYS = ("title", "artist", "date", "encoder")
 
 
@@ -259,16 +261,91 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
     return data
 
 
-def _verify_managed_bytes_under_store_lock(store: AssetStore, record: dict[str, Any]) -> Path:
-    """Verify cached-analysis source bytes without reparsing media metadata."""
+def _source_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise MediaAnalysisError("ANALYSIS_DEADLINE_EXCEEDED")
+
+
+def _hash_source_under_deadline(
+    path: Path, deadline: float | None, *, expected_fingerprint: tuple[int, int, int, int, int, int, int] | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or (expected_fingerprint is not None
+                    and _source_fingerprint(opened) != expected_fingerprint)):
+            raise ValueError("managed asset changed during content verification")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            while True:
+                _check_deadline(deadline)
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+    except OSError as exc:
+        raise ValueError("managed asset is missing or failed its content hash") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    _check_deadline(deadline)
+    return digest.hexdigest()
+
+
+def _verify_managed_bytes_under_store_lock(
+    store: AssetStore, record: dict[str, Any], *, deadline: float | None = None,
+) -> Path:
+    """Verify source bytes once per unchanged filesystem fingerprint.
+
+    The store locks serialize application mutations. Device, inode, size, mtime,
+    and ctime detect external replacement or modification between reads; a new
+    fingerprint always triggers a full SHA-256 check before it is cached.
+    """
+    _check_deadline(deadline)
     source = store._managed_path(record)
     try:
         info = source.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_size != record["size_bytes"]
-                or _hash_file(source) != record["sha256"]):
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size != record["size_bytes"]):
             raise ValueError("managed asset is missing or failed its content hash")
     except OSError as exc:
         raise ValueError("managed asset is missing or failed its content hash") from exc
+    fingerprint = _source_fingerprint(info)
+    key = record["id"]
+    cache = getattr(store, "_media_verified_source_fingerprints", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        store._media_verified_source_fingerprints = cache
+    cached = cache.get(key)
+    if cached == (record.get("path"), record.get("sha256"), fingerprint):
+        _check_deadline(deadline)
+        cache.pop(key, None)
+        cache[key] = cached
+        return source
+    if _hash_source_under_deadline(
+            source, deadline, expected_fingerprint=fingerprint,
+    ) != record["sha256"]:
+        raise ValueError("managed asset is missing or failed its content hash")
+    try:
+        after = source.lstat()
+    except OSError as exc:
+        raise ValueError("managed asset is missing or failed its content hash") from exc
+    if _source_fingerprint(after) != fingerprint:
+        raise ValueError("managed asset changed during content verification")
+    cache[key] = (record.get("path"), record.get("sha256"), fingerprint)
+    while len(cache) > _VERIFIED_SOURCE_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    _check_deadline(deadline)
     return source
 
 
@@ -432,22 +509,25 @@ class MediaIntelligence:
         if isinstance(max_scenes, bool) or not isinstance(max_scenes, int) or not 1 <= max_scenes <= _SCENE_COUNT_LIMIT:
             raise MediaAnalysisError(f"max scenes must be between 1 and {_SCENE_COUNT_LIMIT}")
         threshold = round(float(scene_threshold), 3)
+        deadline = time.monotonic() + self.timeout
         with self.store._lock, self.store._process_lock():
-            record, source = self._verified_asset_under_store_lock(asset_id)
+            record, source, probe = self._verified_asset_under_store_lock(asset_id, deadline=deadline)
             cached = _load_analysis(self.store, asset_id, record)
         if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
                 and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
             publication = publication_lock if publication_lock is not None else self.store._lock
             with publication:
                 with self.store._lock, self.store._process_lock():
-                    record, source = self._verified_asset_under_store_lock(asset_id)
+                    record, source, probe = self._verified_asset_under_store_lock(
+                        asset_id, deadline=deadline,
+                    )
                     cached = _load_analysis(self.store, asset_id, record)
                     if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
                             and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
+                        self._remaining(deadline)
                         return cached
 
-        deadline = time.monotonic() + self.timeout
-        probe = self._probe(source, deadline=deadline)
+        self._remaining(deadline)
         metadata = self._metadata(record, probe)
         video_stream = next(stream for stream in probe["streams"] if stream.get("codec_type") == "video")
         source_time_origin = _finite_number(video_stream.get("start_time"))
@@ -559,9 +639,15 @@ class MediaIntelligence:
             publication = publication_lock if publication_lock is not None else self.store._lock
             with publication:
                 with self.store._lock, self.store._process_lock():
-                    after, _ = self._verified_asset_under_store_lock(asset_id)
-                    if after.get("sha256") != record.get("sha256") or after.get("path") != record.get("path"):
+                    self._remaining(deadline)
+                    after_record = self.store._asset(asset_id)
+                    if (after_record.get("sha256") != record.get("sha256")
+                            or after_record.get("path") != record.get("path")):
                         raise MediaAnalysisError("video asset changed during analysis")
+                    _verify_managed_bytes_under_store_lock(
+                        self.store, after_record, deadline=deadline,
+                    )
+                    self._remaining(deadline)
                     replacement_names = self._replaceable_analysis_files(directory, asset_id)
                     cache_path = _cache_path(self.store, asset_id)
                     try:
@@ -575,9 +661,12 @@ class MediaIntelligence:
                         replacing=replacement_names,
                         additional_bytes=total_image_bytes + encoded_cache_size,
                     )
+                    self._remaining(deadline)
                     for image, name in prepared_images:
+                        self._remaining(deadline)
                         os.replace(image, directory / name)
                         new_keyframes.append(name)
+                    self._remaining(deadline)
                     self._write_cache(asset_id, result)
                     cache_committed = True
                     self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
@@ -604,14 +693,22 @@ class MediaIntelligence:
                 replaceable.add(path.name)
         return replaceable
 
-    def _verified_asset_under_store_lock(self, asset_id: str) -> tuple[dict[str, Any], Path]:
-        """Validate manifest and managed bytes while the caller owns both store locks."""
+    def _verified_asset_under_store_lock(
+        self, asset_id: str, *, deadline: float,
+    ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+        """Validate bytes and metadata with the caller's shared wall-clock budget."""
+        self._remaining(deadline)
         record = self.store._asset(asset_id)
         if record["kind"] != "video":
             raise ValueError("asset must be video")
         source = self.store._managed_path(record)
-        self.store._verify_managed(source, record)
-        return dict(record), source
+        _verify_managed_bytes_under_store_lock(self.store, record, deadline=deadline)
+        probe = self._probe(source, deadline=deadline)
+        self._remaining(deadline)
+        if self.store._inspect(source, record["kind"], probe_data=probe) != record["metadata"]:
+            raise ValueError("managed asset metadata no longer matches its validated probe")
+        self._remaining(deadline)
+        return dict(record), source, probe
 
     @staticmethod
     def _remaining(deadline: float) -> float:
