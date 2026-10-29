@@ -259,6 +259,17 @@ class MediaIntelligenceTests(unittest.TestCase):
                                           analysis_id=result["analysis_id"]).startswith(b"\xff\xd8\xff"))
             self.assertEqual(search_assets(self.store, "three-scene-clip")[0]["id"], self.asset["id"])
 
+    def test_missing_analysis_cache_reads_do_not_hash_managed_video(self):
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        self.assertFalse(cache.exists())
+        original_hash = media_module._hash_source_under_deadline
+        with patch.object(media_module, "_hash_source_under_deadline", wraps=original_hash) as hash_call:
+            self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+            with self.assertRaisesRegex(MediaAnalysisError, "keyframe not found"):
+                keyframe_path(self.store, self.asset["id"], 0)
+            self.assertEqual(search_assets(self.store, "three-scene-clip")[0]["id"], self.asset["id"])
+        self.assertEqual(hash_call.call_count, 0)
+
     def test_source_hash_is_amortized_across_keyframe_set_reads(self):
         result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
         self.store._media_verified_source_fingerprints.clear()
@@ -315,6 +326,20 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertTrue(relinked["analysis_cleanup_pending"])
         self.assertEqual(self.store.list_assets()[0]["filename"], "committed-renamed-clip.mp4")
         self.assertTrue((self.store.root / relinked["path"]).is_file())
+
+    def test_relink_reports_nonfile_analysis_entry_as_pending_cleanup(self):
+        self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        cache.unlink()
+        cache.mkdir()
+
+        relinked = self.store.relink(
+            self.asset["id"], self.source, filename="renamed-with-unsafe-cache.mp4",
+        )
+
+        self.assertTrue(relinked["analysis_cleanup_pending"])
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(self.store.list_assets()[0]["filename"], "renamed-with-unsafe-cache.mp4")
 
     def test_analysis_deadline_is_created_before_managed_file_validation(self):
         captured = {}

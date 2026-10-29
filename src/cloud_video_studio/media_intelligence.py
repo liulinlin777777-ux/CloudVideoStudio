@@ -409,16 +409,29 @@ def _verify_managed_bytes_under_store_lock(
     return source
 
 
+def _analysis_for_record_under_store_lock(
+    store: AssetStore, asset_id: str, record: dict[str, Any],
+) -> dict[str, Any] | None:
+    if record["kind"] != "video":
+        raise MediaAnalysisError("analysis is available for video assets only")
+    # Most video assets have never been analyzed. Read and validate the small,
+    # project-local cache first so ordinary library refresh/search does not hash
+    # the entire source file. A present valid cache is returned only after the
+    # managed source bytes have been verified against the manifest.
+    analysis = _load_analysis(store, asset_id, record)
+    if analysis is None:
+        return None
+    _verify_managed_bytes_under_store_lock(store, record)
+    return analysis
+
+
 def _analysis_under_store_lock(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
     if not _ASSET_ID.fullmatch(asset_id):
         raise MediaAnalysisError("invalid asset id")
     record = next((item for item in store._read_manifest() if item["id"] == asset_id), None)
     if record is None:
         raise MediaAnalysisError("unknown asset id")
-    if record["kind"] != "video":
-        raise MediaAnalysisError("analysis is available for video assets only")
-    _verify_managed_bytes_under_store_lock(store, record)
-    return _load_analysis(store, asset_id, record)
+    return _analysis_for_record_under_store_lock(store, asset_id, record)
 
 
 def get_analysis(store: AssetStore, asset_id: str) -> dict[str, Any] | None:
@@ -486,11 +499,11 @@ def search_assets(store: AssetStore, query: str) -> list[dict[str, Any]]:
             }
             if record.get("kind") == "video":
                 try:
-                    _verify_managed_bytes_under_store_lock(store, record)
+                    analysis = _analysis_for_record_under_store_lock(
+                        store, record["id"], record,
+                    )
                 except ValueError:
                     analysis = None
-                else:
-                    analysis = _load_analysis(store, record["id"], record)
                 if analysis:
                     searchable["analysis"] = {
                         "metadata": analysis.get("metadata"),

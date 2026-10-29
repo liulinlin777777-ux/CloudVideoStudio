@@ -449,6 +449,8 @@ class AssetStore:
                 continue
             if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 derivative.unlink(missing_ok=True)
+            else:
+                raise ValueError("analysis derivative is not a regular file")
 
     def _source(self, path: str | Path) -> tuple[Path, int]:
         source = Path(path).expanduser().absolute()
