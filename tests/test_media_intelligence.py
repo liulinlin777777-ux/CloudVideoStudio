@@ -291,6 +291,20 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in keyframes))
         self.assertIsNone(get_analysis(self.store, self.asset["id"]))
 
+    def test_failed_relink_preserves_the_current_analysis_cache(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        directory = self.store.root / "derivatives"
+        cache = directory / f"{self.asset['id']}-analysis.json"
+        keyframes = [directory / name for name in result["keyframes"]]
+        original_manifest = self.store.manifest.read_bytes()
+        with patch.object(self.store, "_write_manifest", side_effect=OSError("commit failed")):
+            with self.assertRaisesRegex(OSError, "commit failed"):
+                self.store.relink(self.asset["id"], self.source, filename="uncommitted-name.mp4")
+        self.assertEqual(self.store.manifest.read_bytes(), original_manifest)
+        self.assertTrue(cache.is_file())
+        self.assertTrue(all(path.is_file() for path in keyframes))
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), result)
+
     def test_analysis_deadline_is_created_before_managed_file_validation(self):
         captured = {}
 

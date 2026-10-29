@@ -405,7 +405,6 @@ class AssetStore:
             temporary = None
             assets[index] = record
             try:
-                self._remove_analysis_derivatives(asset_id)
                 self._write_manifest(assets)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -414,6 +413,7 @@ class AssetStore:
                 old_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            self._remove_analysis_derivatives(asset_id)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
