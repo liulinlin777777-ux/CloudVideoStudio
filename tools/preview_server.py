@@ -6,11 +6,12 @@ import re
 import tempfile
 import threading
 import uuid
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cloud_video_studio.assets import AssetStore
+from cloud_video_studio.media_intelligence import MediaIntelligence, get_analysis, read_keyframe, search_assets
 from cloud_video_studio.project import Project
 from cloud_video_studio.timeline_edits import (
     add_clip, add_track, delete_clip, move_clip, move_clip_to_track, reorder_clip, split_clip, trim_clip,
@@ -21,15 +22,18 @@ p = argparse.ArgumentParser()
 p.add_argument('--media-root', required=True)
 p.add_argument('--port', type=int, default=8774)
 p.add_argument('--ffmpeg', default='ffmpeg')
+p.add_argument('--ffprobe', default='ffprobe')
 a = p.parse_args()
 root = Path(a.media_root).resolve()
 html = Path(__file__).resolve().parents[1] / 'web/index.html'
 lock = threading.Lock()
 asset_lock = threading.RLock()
+analysis_lock = threading.Lock()
 MAX_BODY = 65536
 MAX_UPLOAD = 512 * 1024 * 1024
 upload_slots = threading.BoundedSemaphore(2)
 asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024)
+media_intelligence = MediaIntelligence(asset_store, ffmpeg=a.ffmpeg, ffprobe=a.ffprobe)
 
 
 def saved_path():
@@ -124,33 +128,48 @@ class Handler(BaseHTTPRequestHandler):
         if not self.safe():
             return self.reply(403, {'error': 'ORIGIN_DENIED'})
         try:
-            if self.path == '/':
+            parsed = urlsplit(self.path)
+            route = parsed.path
+            if route == '/':
                 return self.reply(200, html.read_bytes(), 'text/html; charset=utf-8')
-            if self.path == '/project':
+            if route == '/project':
                 project = current()
                 compile_timeline(project)
                 return self.reply(200, project.to_dict())
-            if self.path == '/assets':
+            if route == '/assets':
                 with asset_lock:
                     return self.reply(200, {'schema_version': 2, 'assets': asset_store.list_assets()})
-            if self.path.startswith('/assets/') and self.path.endswith('/thumbnail'):
-                asset_id = self.path[len('/assets/'):-len('/thumbnail')].strip('/')
-                if len(asset_id) != 32 or any(ch not in '0123456789abcdef' for ch in asset_id):
-                    return self.reply(404, {'error': 'NOT_FOUND'})
+            analysis_match = re.fullmatch(r'/assets/([0-9a-f]{32})/analysis', route)
+            if analysis_match:
                 with asset_lock:
-                    derivative = asset_store.create_thumbnail(asset_id)
+                    result = get_analysis(asset_store, analysis_match.group(1))
+                if result is None:
+                    return self.reply(404, {'error': 'ANALYSIS_NOT_FOUND'})
+                return self.reply(200, {key: value for key, value in result.items() if key != 'keyframes'})
+            keyframe_match = re.fullmatch(r'/assets/([0-9a-f]{32})/keyframes/(\d{1,2})', route)
+            if keyframe_match:
+                values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
+                if (set(values) != {'analysis_id'} or len(values.get('analysis_id', [])) != 1
+                        or not re.fullmatch(r'[0-9a-f]{12}', values['analysis_id'][0])):
+                    return self.reply(400, {'error': 'INVALID_ANALYSIS_ID'})
+                with asset_lock:
+                    data = read_keyframe(asset_store, keyframe_match.group(1), int(keyframe_match.group(2)),
+                                         analysis_id=values['analysis_id'][0])
+                return self.reply(200, data, 'image/jpeg')
+            thumbnail_match = re.fullmatch(r'/assets/([0-9a-f]{32})/thumbnail', route)
+            if thumbnail_match:
+                with asset_lock:
+                    derivative = asset_store.create_thumbnail(thumbnail_match.group(1))
                     path = asset_store.root / derivative['path']
                     return self.reply(200, path.read_bytes(), 'image/jpeg')
-            if self.path.startswith('/assets/') and self.path.endswith('/proxy'):
-                asset_id = self.path[len('/assets/'):-len('/proxy')].strip('/')
-                if len(asset_id) != 32 or any(ch not in '0123456789abcdef' for ch in asset_id):
-                    return self.reply(404, {'error': 'NOT_FOUND'})
+            proxy_match = re.fullmatch(r'/assets/([0-9a-f]{32})/proxy', route)
+            if proxy_match:
                 with asset_lock:
-                    derivative = asset_store.create_proxy(asset_id, ffmpeg=a.ffmpeg)
+                    derivative = asset_store.create_proxy(proxy_match.group(1), ffmpeg=a.ffmpeg)
                     path = asset_store.root / derivative['path']
                     return self.reply(200, path.read_bytes(), 'video/mp4')
-            if self.path.startswith('/media/') and '/' not in self.path[7:]:
-                return self.media(self.path[7:])
+            if route.startswith('/media/') and '/' not in route[7:]:
+                return self.media(route[7:])
             return self.reply(404, {'error': 'NOT_FOUND'})
         except Exception as error:
             return self.reply(400, {'error': type(error).__name__})
@@ -226,6 +245,8 @@ class Handler(BaseHTTPRequestHandler):
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
                 upload_slots.release()
+        if self.path == '/assets/search' and not self.browser_origin():
+            return self.reply(403, {'error': 'ORIGIN_DENIED'})
         try:
             data = self.read_json()
         except OverflowError:
@@ -233,6 +254,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             return self.reply(400, {'error': type(error).__name__})
         try:
+            if self.path == '/assets/search':
+                if not isinstance(data, dict) or set(data) != {'q'} or not isinstance(data['q'], str):
+                    raise ValueError('invalid asset search fields')
+                with asset_lock:
+                    return self.reply(200, {'assets': search_assets(asset_store, data['q'])})
+            analysis_match = re.fullmatch(r'/assets/([0-9a-f]{32})/analyze', self.path)
+            if analysis_match:
+                if not self.browser_origin():
+                    return self.reply(403, {'error': 'ORIGIN_DENIED'})
+                if (not isinstance(data, dict) or not data
+                        or set(data) - {'scene_threshold', 'max_scenes', 'force'}):
+                    raise ValueError('invalid media analysis fields')
+                force = data.get('force', False)
+                if not isinstance(force, bool):
+                    raise ValueError('force must be a boolean')
+                if not analysis_lock.acquire(blocking=False):
+                    return self.reply(409, {'error': 'ANALYSIS_BUSY'})
+                try:
+                    result = media_intelligence.analyze(
+                        analysis_match.group(1),
+                        scene_threshold=data.get('scene_threshold', 0.35),
+                        max_scenes=data.get('max_scenes', 24),
+                        force=force,
+                        publication_lock=asset_lock,
+                    )
+                    return self.reply(200, {key: value for key, value in result.items() if key != 'keyframes'})
+                finally:
+                    analysis_lock.release()
             if self.path == '/edit':
                 if not isinstance(data, dict):
                     raise ValueError('request must be an object')
