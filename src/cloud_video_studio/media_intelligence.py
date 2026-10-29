@@ -23,10 +23,10 @@ from .assets import AssetStore
 
 _ASSET_ID = re.compile(r"^[0-9a-f]{32}$")
 _SCENE_LINE = re.compile(
-    r"frame:\s*(?P<frame>\d+)\s+pts:\s*-?\d+\s+pts_time:(?P<time>-?\d+(?:\.\d+)?)\s*\n"
+    r"frame:\s*\d+\s+pts:\s*(?P<pts>-?\d+)\s+pts_time:(?P<time>-?\d+(?:\.\d+)?)\s*\n"
     r"lavfi\.scene_score=(?P<score>\d+(?:\.\d+)?)"
 )
-_CACHE_SCHEMA = 1
+_CACHE_SCHEMA = 2
 _CACHE_BYTES_LIMIT = 1024 * 1024
 _KEYFRAME_BYTES_LIMIT = 2 * 1024 * 1024
 _KEYFRAME_COUNT_LIMIT = 25
@@ -212,6 +212,33 @@ def search_assets(store: AssetStore, query: str) -> list[dict[str, Any]]:
     return found
 
 
+def _select_scene_candidates(
+    detections: list[dict[str, Any]], limit: int, duration: float,
+) -> list[dict[str, Any]]:
+    """Keep strong scene candidates distributed across the analyzed duration."""
+    if len(detections) <= limit:
+        return detections
+    selected: list[dict[str, Any]] = []
+    chosen_pts: set[int] = set()
+    for bucket in range(limit):
+        start = duration * bucket / limit
+        end = duration * (bucket + 1) / limit
+        candidates = [
+            item for item in detections
+            if item["pts"] not in chosen_pts
+            and start <= item["start_seconds"] < end
+        ]
+        if candidates:
+            choice = max(candidates, key=lambda item: (item["score"], -item["start_seconds"]))
+            selected.append(choice)
+            chosen_pts.add(choice["pts"])
+    if len(selected) < limit:
+        remaining = [item for item in detections if item["pts"] not in chosen_pts]
+        remaining.sort(key=lambda item: (-item["score"], item["start_seconds"]))
+        selected.extend(remaining[:limit - len(selected)])
+    return sorted(selected, key=lambda item: item["start_seconds"])
+
+
 class MediaIntelligence:
     """Analyze an imported video without exposing arbitrary filesystem paths."""
 
@@ -268,16 +295,21 @@ class MediaIntelligence:
         if len(scene_run.stdout) > 16 * 1024 * 1024:
             raise MediaAnalysisError("scene analysis output exceeded its safety limit")
         detections = []
+        seen_pts: set[int] = set()
         for match in _SCENE_LINE.finditer(scene_run.stdout):
+            pts = int(match.group("pts"))
             timestamp = float(match.group("time"))
             score = float(match.group("score"))
-            if not math.isfinite(timestamp) or not math.isfinite(score) or timestamp < 0 or timestamp > analyzed_duration + 0.5:
+            if (pts in seen_pts or not math.isfinite(timestamp) or not math.isfinite(score)
+                    or timestamp < 0 or timestamp > analyzed_duration + 0.5):
                 continue
+            seen_pts.add(pts)
             detections.append({
+                "pts": pts,
                 "start_seconds": round(timestamp, 6),
                 "score": round(min(max(score, 0.0), 1.0), 6),
             })
-        selected = detections[:max_scenes]
+        selected = _select_scene_candidates(detections, max_scenes, analyzed_duration)
         scene_detection_truncated = len(detections) > max_scenes
         output_count = len(selected) + 1
         analysis_id = uuid.uuid4().hex[:12]
@@ -286,9 +318,11 @@ class MediaIntelligence:
         try:
             with tempfile.TemporaryDirectory(prefix=f".{asset_id}-analysis-", dir=directory) as temporary_dir:
                 pattern = str(Path(temporary_dir) / "frame-%03d.jpg")
+                selected_pts = "+".join(f"eq(pts,{item['pts']})" for item in selected)
+                selection = "eq(n,0)" + (f"+{selected_pts}" if selected_pts else "")
                 frame_filter = (
                     f"trim=duration={analyzed_duration:.6f},"
-                    f"select='eq(n,0)+gt(scene,{threshold:.3f})',"
+                    f"select='{selection}',"
                     "scale=640:360:force_original_aspect_ratio=decrease"
                 )
                 frame_cmd = [

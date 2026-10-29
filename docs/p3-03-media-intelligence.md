@@ -25,9 +25,9 @@ validated per-asset analysis index, not a browser-provided path.
 
 Each operation is bounded to 120 seconds, examines at most the first 600 seconds
 of a source, accepts scene thresholds from 0.05 through 0.95, records up to 24
-scene boundaries plus the opening frame, caps each keyframe at 2 MiB and total
-analysis keyframes at 80 MiB. Results report whether the duration or scene list
-was truncated.
+scene boundaries selected across the analyzed duration plus the opening frame,
+caps each keyframe at 2 MiB and total analysis keyframes at 80 MiB. Results
+report whether the duration or scene list was truncated.
 
 Scene scores are candidate boundaries, not a semantic description of what a
 shot depicts. P3-03 does not generate captions or transcript text. `whisper-cli`

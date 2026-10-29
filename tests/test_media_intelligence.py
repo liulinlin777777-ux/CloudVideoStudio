@@ -12,6 +12,7 @@ from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.media_intelligence import (
     MediaAnalysisError,
     MediaIntelligence,
+    _select_scene_candidates,
     get_analysis,
     keyframe_path,
     search_assets,
@@ -46,6 +47,19 @@ class MediaIntelligenceTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_scene_selection_covers_the_full_duration(self):
+        detections = [
+            {"pts": index, "start_seconds": float(time), "score": score}
+            for index, (time, score) in enumerate([
+                (2, 0.50), (8, 0.80), (18, 0.70), (28, 0.90),
+                (45, 0.60), (62, 0.95), (79, 0.85), (97, 0.75),
+            ])
+        ]
+        selected = _select_scene_candidates(detections, limit=4, duration=100)
+        self.assertEqual(len(selected), 4)
+        self.assertEqual([item["start_seconds"] for item in selected], [8.0, 28.0, 62.0, 79.0])
+        self.assertEqual([item["pts"] for item in selected], sorted(item["pts"] for item in selected))
 
     def test_real_ffmpeg_scene_detection_keyframes_and_cache(self):
         result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20, max_scenes=8)
