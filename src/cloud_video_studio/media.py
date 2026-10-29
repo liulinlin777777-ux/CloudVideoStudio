@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from fractions import Fraction
 import hashlib
+import json
 import math
 from pathlib import Path
+import re
 import resource
 import subprocess
+import tempfile
 import time
 from typing import Any
 
 from .project import Asset, Clip, Effect, Project, Sequence, Track
+from .postproduction import audio_effect_values, safe_text, title_file_token, video_effect_filters
 
 
 def make_demo_project() -> Project:
@@ -117,10 +121,34 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
         "crossfade": {"duration_frames"},
         "pip": {"x", "y", "width", "height"},
         "volume": {"gain"},
+        "color": {"brightness", "contrast", "saturation"},
+        "crop": {"x", "y", "width", "height"},
+        "title": {"text", "x", "y", "font_size", "color", "start_frame", "duration_frames"},
+        "subtitle": {"asset_id", "start_frame", "duration_frames", "position", "font_size", "color"},
+        "mute": {"enabled"},
+        "fade": {"in_frames", "out_frames"},
+        "normalize": {"enabled"},
     }
+
+    def filter_seconds(frames: int) -> str:
+        micros = sequence.frame_time(frames) * 1_000_000
+        rounded = (2 * micros.numerator + micros.denominator) // (2 * micros.denominator)
+        whole, fractional = divmod(rounded, 1_000_000)
+        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
     for track in sequence.tracks:
         if track.kind not in {"video", "audio"}:
             raise ValueError("unsupported track kind")
+        if track.effects:
+            if track.kind != "audio":
+                raise ValueError("only audio tracks support track-level effects")
+            track_kinds = [effect.kind for effect in track.effects]
+            if len(track_kinds) != len(set(track_kinds)):
+                raise ValueError(f"track {track.id} has duplicate effects")
+            for effect in track.effects:
+                if effect.kind not in {"volume", "mute", "fade", "normalize"} or set(effect.parameters) != expected[effect.kind]:
+                    raise ValueError("audio track effects support only volume, mute, fade and normalization")
+                if effect.kind == "normalize" and type(effect.parameters["enabled"]) is not bool:
+                    raise ValueError("normalize enabled must be a boolean")
         ordered = sorted(track.clips, key=lambda item: (item.start_frame, item.id))
         if track.kind == "audio" and any(_effect(clip, "pip") or _effect(clip, "crossfade") for clip in ordered):
             raise ValueError("audio tracks do not support video effects")
@@ -149,12 +177,14 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
             if len(kinds) != len(set(kinds)):
                 raise ValueError(f"clip {clip.id} has duplicate effects")
             for effect in clip.effects:
-                if effect.kind not in expected or set(effect.parameters) != expected[effect.kind]:
+                allowed_parameters = expected.get(effect.kind)
+                if (allowed_parameters is None or set(effect.parameters) != allowed_parameters
+                        and not (effect.kind == "title" and set(effect.parameters) == allowed_parameters | {"font_family"})):
                     raise ValueError(f"unsupported effect on clip {clip.id}: {effect.kind}")
-                if track.kind == "audio" and effect.kind != "volume":
-                    raise ValueError("audio clips only support volume")
-                if track.kind == "video" and effect.kind == "volume":
-                    raise ValueError("video clips do not support volume")
+                if track.kind == "audio" and effect.kind not in {"volume", "mute", "fade", "normalize", "crossfade"}:
+                    raise ValueError("audio tracks only support volume, mute and fades")
+                if track.kind == "video" and effect.kind in {"volume", "mute", "fade"}:
+                    raise ValueError("video clips do not support audio effects")
             pip = _effect(clip, "pip")
             if pip is not None:
                 values = {}
@@ -168,20 +198,28 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
                         values["x"] + values["width"] > sequence.width or
                         values["y"] + values["height"] > sequence.height):
                     raise ValueError("pip rectangle is outside the sequence")
+                if any(value % 2 for value in values.values()):
+                    raise ValueError("pip coordinates and dimensions must be even for 4:2:0 video")
             if track.kind == "audio":
-                volume = _effect(clip, "volume")
-                if volume is not None:
-                    _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0)
+                audio_effect_values(clip, track.effects)
+            if track.kind == "video":
+                uri_by_id = {asset.id: asset.uri for asset in project.assets}
+                for effect in clip.effects:
+                    if effect.kind == "subtitle":
+                        subtitle_asset = next((asset for asset in project.assets if asset.id == effect.parameters.get("asset_id")), None)
+                        if (subtitle_asset is None or not subtitle_asset.uri.lower().endswith('.srt')
+                                or subtitle_asset.metadata.get('kind') != 'subtitle'):
+                            raise ValueError("subtitle effect must reference an imported .srt asset")
+                video_effect_filters(clip, sequence, lambda frame: filter_seconds(frame), uri_by_id)
 
-    inputs = list(dict.fromkeys(clip.asset_id for clip in all_clips))
+    inputs = list(dict.fromkeys(
+        [clip.asset_id for clip in all_clips] + [
+            effect.parameters["asset_id"] for clip in all_clips for effect in clip.effects
+            if effect.kind == "subtitle" and isinstance(effect.parameters.get("asset_id"), str)
+        ]
+    ))
     indexes = {asset_id: index for index, asset_id in enumerate(inputs)}
     fps = f"{sequence.fps_num}/{sequence.fps_den}"
-
-    def filter_seconds(frames: int) -> str:
-        micros = sequence.frame_time(frames) * 1_000_000
-        rounded = (2 * micros.numerator + micros.denominator) // (2 * micros.denominator)
-        whole, fractional = divmod(rounded, 1_000_000)
-        return f"{whole}.{fractional:06d}".rstrip("0").rstrip(".")
 
     def sample_index(frames: int) -> int:
         samples = sequence.frame_time(frames) * 48000
@@ -194,22 +232,50 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
     base = "vbase0"
     node = 1
     video_tracks = [track for track in sequence.tracks if track.kind == "video"]
+    uri_by_id = {asset.id: asset.uri for asset in project.assets}
     for track_index, track in enumerate(video_tracks):
         for clip_index, clip in enumerate(sorted(track.clips, key=lambda item: (item.start_frame, item.id))):
             label = f"vclip{track_index}_{clip_index}"
             start_time = filter_seconds(clip.start_frame)
             pip = _effect(clip, "pip")
-            out_width = pip.parameters["width"] if pip else sequence.width
-            out_height = pip.parameters["height"] if pip else sequence.height
             graph.append(
                 f"[{indexes[clip.asset_id]}:v]fps={fps},"
                 f"trim=start_frame={clip.source_in_frame}:"
                 f"end_frame={clip.source_in_frame + clip.duration_frames},"
                 f"setpts=N*{sequence.fps_den}/{sequence.fps_num}/TB+"
                 f"{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB,"
-                f"scale={out_width}:{out_height},setsar=1,fps={fps},"
+                f"scale={sequence.width}:{sequence.height},setsar=1,fps={fps},"
                 f"format=yuva420p[{label}]"
             )
+            all_clip_filters = video_effect_filters(clip, sequence, filter_seconds, uri_by_id)
+            subtitle_filters = [item for item in all_clip_filters if item.startswith("subtitles=")]
+            clip_filters = [item for item in all_clip_filters if not item.startswith("subtitles=")]
+            if clip_filters:
+                filtered = label + "fx"
+                graph.append(f"[{label}]" + ",".join(clip_filters) + f"[{filtered}]")
+                label = filtered
+            if subtitle_filters:
+                subtitle = next(effect for effect in clip.effects if effect.kind == "subtitle")
+                caption_start = subtitle.parameters["start_frame"]
+                caption_end = caption_start + subtitle.parameters["duration_frames"]
+                subtitle_label = label + "subtitle"
+                graph.append(
+                    f"color=c=black@0:s={sequence.width}x{sequence.height}:r={fps}:"
+                    f"d={filter_seconds(clip.duration_frames)},format=yuva420p,geq=r=0:g=0:b=0:a=0,"
+                    f"setpts=PTS-STARTPTS,{subtitle_filters[0]},"
+                    f"trim=start_frame={caption_start}:end_frame={caption_end},"
+                    f"setpts=PTS+{clip.start_frame}*{sequence.fps_den}/{sequence.fps_num}/TB[{subtitle_label}]"
+                )
+                captioned = label + "captioned"
+                graph.append(
+                    f"[{label}][{subtitle_label}]overlay=eof_action=pass:shortest=0:format=auto:"
+                    f"enable='between(n\\,{caption_start}\\,{caption_end - 1})'[{captioned}]"
+                )
+                label = captioned
+            if pip is not None:
+                scaled = label + "pipscale"
+                graph.append(f"[{label}]scale={pip.parameters['width']}:{pip.parameters['height']}[{scaled}]")
+                label = scaled
             fade = _effect(clip, "crossfade")
             if fade is not None:
                 seconds = filter_seconds(fade.parameters["duration_frames"])
@@ -229,41 +295,66 @@ def _compile_extensible_timeline(project: Project) -> dict[str, Any]:
 
     audio_labels = []
     audio_index = 0
+    normalize_audio = False
     for track in sequence.tracks:
         if track.kind != "audio":
             continue
+        normalize_audio = normalize_audio or any(
+            effect.kind == "normalize" and effect.parameters["enabled"] for effect in track.effects
+        ) or any(
+            effect.kind == "normalize" and effect.parameters["enabled"]
+            for clip in track.clips for effect in clip.effects
+        )
         for clip in sorted(track.clips, key=lambda item: (item.start_frame, item.id)):
             label = f"aclip{audio_index}"
             start_sample = sample_index(clip.source_in_frame)
             end_sample = sample_index(clip.source_in_frame + clip.duration_frames)
             delay = sample_index(clip.start_frame)
-            volume = _effect(clip, "volume")
-            gain = _finite_number(volume.parameters["gain"], "volume gain", 0.0, 1.0) if volume else 1.0
+            gain, muted, fade_in, fade_out = audio_effect_values(clip, track.effects)
+            audio_filters = [f"volume={gain:g}"]
+            if fade_in:
+                audio_filters.append(f"afade=t=in:st=0:d={filter_seconds(fade_in)}")
+            if fade_out:
+                fade_start = filter_seconds(clip.duration_frames - fade_out)
+                audio_filters.append(f"afade=t=out:st={fade_start}:d={filter_seconds(fade_out)}")
+            audio_filters.append(f"adelay={delay}S|{delay}S")
             graph.append(
                 f"[{indexes[clip.asset_id]}:a]aresample=48000,atrim=start_sample={start_sample}:"
-                f"end_sample={end_sample},asetpts=N/SR/TB,volume={gain:g},adelay={delay}S|{delay}S,"
+                f"end_sample={end_sample},asetpts=N/SR/TB,{','.join(audio_filters)},"
                 f"apad,atrim=end_sample={sample_index(duration_frames)},"
                 f"asetpts=N/SR/TB[{label}]"
             )
             audio_labels.append(label)
             audio_index += 1
     if audio_labels:
-        graph.append("".join(f"[{label}]" for label in audio_labels) +
-                     f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
-                     f"atrim=end_sample={sample_index(duration_frames)},"
-                     "asetpts=N/SR/TB[aout]")
+        mix_filters = [f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0"]
+        if normalize_audio:
+            mix_filters.extend(["loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "aresample=48000"])
+        mix_filters.extend(["alimiter=limit=0.95:level=false",
+                            f"atrim=end_sample={sample_index(duration_frames)}", "asetpts=N/SR/TB"])
+        graph.append("".join(f"[{label}]" for label in audio_labels) + ",".join(mix_filters) + "[aout]")
     else:
         graph.append(f"anullsrc=r=48000:cl=stereo,atrim=end_sample={sample_index(duration_frames)}[aout]")
     return {
         "inputs": inputs, "filtergraph": ";".join(graph),
         "duration_frames": duration_frames, "fps": fps,
         "width": sequence.width, "height": sequence.height,
+        "audio_normalization": normalize_audio,
+        "title_texts": {
+            title_file_token(clip): safe_text(effect.parameters["text"])
+            for clip in all_clips for effect in clip.effects if effect.kind == "title"
+        },
     }
 
 
 def compile_timeline(project: Project) -> dict[str, Any]:
     """Compile the explicitly supported two-video/two-audio demo topology."""
     project.validate()
+    p2c_effects = {"color", "crop", "title", "subtitle", "mute", "fade", "normalize"}
+    if (any(track.effects for sequence in project.sequences for track in sequence.tracks)
+            or any(effect.kind in p2c_effects for sequence in project.sequences
+                   for track in sequence.tracks for clip in track.clips for effect in clip.effects)):
+        return _compile_extensible_timeline(project)
     if len(project.sequences) == 1:
         tracks = project.sequences[0].tracks
         if len(tracks) != 4 or [track.kind for track in tracks] != ["video", "video", "audio", "audio"] or [len(track.clips) for track in tracks] != [2, 1, 1, 1]:
@@ -469,7 +560,8 @@ def generate_sources(root: str | Path, ffmpeg: str = "ffmpeg") -> dict[str, Path
 
 def _run_checked(command: list[str], timeout: float | None, operation: str) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"{operation} timed out") from exc
     if result.returncode != 0:
@@ -491,6 +583,131 @@ def _inside_root(path: Path, root: Path, name: str) -> Path:
         resolved.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{name} must stay inside the render root") from exc
+    return resolved
+
+
+def _filter_path(path: Path) -> str:
+    """Escape an owned file path for the quoted FFmpeg filter option."""
+    value = str(path)
+    for character in ("\\", "'", ":", ",", ";", "[", "]"):
+        value = value.replace(character, "\\" + character)
+    return value
+
+
+def _audio_qa_graph(graph: str) -> str:
+    """Attach analysis to the compiled complex graph's final audio output."""
+    if not graph.endswith("[aout]"):
+        raise ValueError("compiled graph must end with [aout]")
+    return f"{graph};[aout]ebur128=peak=true,astats=metadata=0:reset=0,silencedetect=noise=-50dB:d=0.5[aqa]"
+
+
+def _parse_audio_qa(stderr: str) -> dict[str, Any]:
+    measurements: dict[str, Any] = {}
+    for key, label in (("peak_level_db", "Peak level dB"), ("rms_level_db", "RMS level dB")):
+        values = re.findall(rf"{label}:\s*(-?inf|[-+]?\d+(?:\.\d+)?)", stderr)
+        if not values:
+            raise RuntimeError(f"pre-export audio QA did not report {label}")
+        value = values[-1]
+        # JSON has no representation for infinity. null denotes silence.
+        measurements[key] = None if value.lower() == "-inf" else float(value)
+    number = r"(-?inf|[-+]?\d+(?:\.\d+)?)"
+    for key, pattern in (("integrated_lufs", rf"\bI:\s*{number}\s+LUFS"),
+                         ("true_peak_dbfs", rf"\bPeak:\s*{number}\s+dBFS")):
+        values = re.findall(pattern, stderr)
+        if values:
+            measurements[key] = None if values[-1] == "-inf" else float(values[-1])
+    counts = re.findall(r"Number of samples:\s*(\d+(?:\.\d+)?)", stderr)
+    if counts:
+        measurements["sample_count"] = int(float(counts[-1]))
+    starts = re.findall(r"silence_start:\s*([-+]?\d+(?:\.\d+)?)", stderr)
+    ends = re.findall(r"silence_end:\s*([-+]?\d+(?:\.\d+)?)", stderr)
+    if starts:
+        measurements["silence_segments"] = [
+            {"start": float(value), "end": float(ends[i]) if i < len(ends) else None}
+            for i, value in enumerate(starts)
+        ]
+    return measurements
+
+
+def _complete_audio_qa(measurements, project, compiled):
+    qa = dict(measurements)
+    sequence = project.sequences[0]
+    duration = float(sequence.frame_time(compiled["duration_frames"]))
+    samples = sequence.frame_time(compiled["duration_frames"]) * 48000
+    expected = (2 * samples.numerator + samples.denominator) // (2 * samples.denominator)
+    qa["expected_sample_count"] = expected
+    observed = qa.get("sample_count")
+    qa["audio_duration_seconds"] = observed / 48000 if observed is not None else None
+    qa["video_duration_seconds"] = duration
+    qa["duration_delta_ms"] = (observed - expected) * 1000 / 48000 if observed is not None else None
+    qa["timeline_sample_alignment"] = ("NOT_VERIFIED" if observed is None else
+        "PASS" if abs(observed - expected) <= 48000 * float(sequence.frame_time(1)) else "WARN")
+    qa["measurement_status"] = "MEASURED" if observed is not None and "integrated_lufs" in qa else "PARTIAL"
+    peaks = [qa.get(key) for key in ("true_peak_dbfs", "peak_level_db")]
+    qa["clipping_detected"] = any(value is not None and value >= 0 for value in peaks)
+    active = []
+    for track in sequence.tracks:
+        if track.kind == "audio":
+            for clip in track.clips:
+                if audio_effect_values(clip, track.effects)[0] > 0:
+                    active.append((float(sequence.frame_time(clip.start_frame)),
+                                   float(sequence.frame_time(clip.start_frame + clip.duration_frames))))
+    qa["silence_expected"] = not active
+    segments = qa.setdefault("silence_segments", [])
+    for segment in segments:
+        end = segment["end"] if segment["end"] is not None else (qa["audio_duration_seconds"] or duration)
+        overlap = sum(max(0., min(end, b) - max(segment["start"], a)) for a, b in active)
+        segment["unexpected"] = overlap > float(sequence.frame_time(1))
+    qa["unexpected_silence"] = any(segment["unexpected"] for segment in segments)
+    return qa
+
+
+def _encoded_audio_qa(path: Path, *, ffmpeg: str, timeout: float) -> dict[str, Any]:
+    """Measure decoded AAC, since a safe input peak does not prove codec output."""
+    try:
+        result = subprocess.run([ffmpeg, "-nostdin", "-i", str(path), "-vn",
+                                 "-af", "ebur128=peak=true,astats=metadata=0:reset=0,silencedetect=noise=-50dB:d=0.5",
+                                 "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=min(float(timeout),45.0), check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("encoded audio QA timed out") from error
+    if result.returncode != 0:
+        raise RuntimeError("encoded audio QA failed")
+    try:
+        measurements = _parse_audio_qa(result.stderr)
+    except RuntimeError as error:
+        raise RuntimeError("encoded audio QA is incomplete") from error
+    if "sample_count" not in measurements or "integrated_lufs" not in measurements:
+        raise RuntimeError("encoded audio QA is incomplete")
+    if any(measurements.get(key) is not None and measurements[key] >= 0
+           for key in ("peak_level_db", "true_peak_dbfs")):
+        raise ValueError("ENCODED_AUDIO_CLIPPING_DETECTED_NORMALIZE_REQUIRED")
+    return measurements
+
+
+def _title_font_family(family: str, text: str) -> str:
+    """Resolve CJK glyph coverage with installed fontconfig, never user paths."""
+    if not any(0x3400 <= ord(char) <= 0x9fff or 0xf900 <= ord(char) <= 0xfaff for char in text):
+        return family
+    alias = "Sans" if family == "Monospace" else family
+    try:
+        match = subprocess.run(["fc-match", "-f", "%{family}\n%{charset}", "--", alias + ":lang=zh-cn"],
+                               capture_output=True, text=True, timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("CJK titles require installed fontconfig and a CJK font") from error
+    lines = match.stdout.splitlines()
+    resolved = lines[0].split(",")[0] if len(lines) >= 2 else ""
+    if not re.fullmatch(r"[A-Za-z0-9 ._-]{1,80}", resolved):
+        raise ValueError("No safe installed CJK font family was resolved")
+    coverage = []
+    try:
+        for part in lines[1].split():
+            ends = part.split("-")
+            coverage.append((int(ends[0],16),int(ends[-1],16)))
+    except ValueError as error:
+        raise ValueError("Installed font coverage could not be verified") from error
+    if any(not char.isspace() and not any(a <= ord(char) <= b for a,b in coverage) for char in text):
+        raise ValueError("The installed font lacks title glyphs; install a suitable CJK font locally")
     return resolved
 
 
@@ -540,35 +757,76 @@ def render_project(
         raise FileExistsError("render output already exists")
 
     hashes_before = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
-    command = [ffmpeg, "-nostdin", "-n"]
-    for asset_id in compiled["inputs"]:
-        command.extend(["-i", str(source_paths[asset_id])])
-    command.extend([
-        "-filter_complex_threads", "1", "-filter_complex", compiled["filtergraph"],
-        "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
-        "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart", str(target),
-    ])
     before_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
-    try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("FFmpeg render timed out") from exc
-    wall_seconds = time.monotonic() - started
-    after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+    with tempfile.TemporaryDirectory(prefix=".cvs-title-", dir=root_path) as title_directory:
+        graph = compiled["filtergraph"]
+        for index, (token, text) in enumerate(compiled.get("title_texts", {}).items()):
+            font_match = re.search(r"drawtext=font='(Sans|Serif|Monospace)':textfile='" + re.escape(token) + "'", graph)
+            if not font_match:
+                raise ValueError("Title font binding is invalid")
+            family = font_match.group(1)
+            resolved = _title_font_family(family, text)
+            graph = graph.replace(f"font='{family}':textfile='{token}'", f"font='{resolved}':textfile='{token}'", 1)
+            text_path = Path(title_directory) / f"title-{index:02d}.txt"
+            text_path.write_text(text, encoding="utf-8", newline="")
+            graph = graph.replace(token, _filter_path(text_path.relative_to(root_path)))
+        if "__CVS_TITLE_" in graph:
+            raise ValueError("title text file token was not staged")
+
+        inputs = [item for asset_id in compiled["inputs"] for item in ("-i", str(source_paths[asset_id]))]
+        qa_command = [
+            ffmpeg, "-nostdin", "-n", *inputs,
+            "-filter_complex_threads", "1", "-filter_complex", _audio_qa_graph(graph),
+            "-map", "[vout]", "-map", "[aqa]",
+            "-f", "null", "-",
+        ]
+        try:
+            qa_result = subprocess.run(
+                qa_command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=min(float(timeout), 45.0), check=False, cwd=root_path,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("pre-export audio QA timed out") from exc
+        if qa_result.returncode != 0:
+            raise RuntimeError(f"pre-export audio QA failed: {qa_result.stderr.strip()}")
+        measurements = _complete_audio_qa(_parse_audio_qa(qa_result.stderr), project, compiled)
+
+        command = [
+            ffmpeg, "-nostdin", "-n", *inputs,
+            "-filter_complex_threads", "1", "-filter_complex", graph,
+            "-map", "[vout]", "-map", "[aout]", "-r", compiled["fps"],
+            "-frames:v", str(compiled["duration_frames"]), "-threads", "2",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(target),
+        ]
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=timeout, check=False, cwd=root_path)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("FFmpeg render timed out") from exc
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg render failed: {result.stderr.strip()}")
     if not target.is_file() or target.stat().st_size <= 0:
         raise RuntimeError("FFmpeg produced an empty output")
+    encoded_measurements = _complete_audio_qa(
+        _encoded_audio_qa(target, ffmpeg=ffmpeg, timeout=timeout), project, compiled)
     hashes_after = {asset_id: _sha256(path) for asset_id, path in source_paths.items()}
     if hashes_after != hashes_before:
         raise RuntimeError("FFmpeg modified one or more source assets")
+    wall_seconds = time.monotonic() - started
+    after_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_seconds = (
         after_cpu.ru_utime + after_cpu.ru_stime - before_cpu.ru_utime - before_cpu.ru_stime
     )
+    loudness = None
+    if compiled.get("audio_normalization"):
+        match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', result.stderr, re.DOTALL)
+        if match:
+            try:
+                loudness = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                loudness = None
     return {
         "status": "completed",
         "wall_seconds": wall_seconds,
@@ -576,4 +834,7 @@ def render_project(
         "output_bytes": target.stat().st_size,
         "source_hashes_before": hashes_before,
         "source_hashes_after": hashes_after,
+        "audio_loudness": loudness,
+        "audio_qa": measurements,
+        "encoded_audio_qa": encoded_measurements,
     }

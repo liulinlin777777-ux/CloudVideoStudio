@@ -36,6 +36,7 @@ class Track:
     id: str
     kind: str
     clips: list[Clip] = field(default_factory=list)
+    effects: list[Effect] = field(default_factory=list)
 
 
 @dataclass
@@ -127,6 +128,12 @@ class Project:
                 if track.kind not in ("video", "audio"):
                     raise ValueError("track kind must be 'video' or 'audio'")
                 _require_list(track.clips, "track clips")
+                _require_list(track.effects, "track effects")
+                if any(not isinstance(effect, Effect) for effect in track.effects):
+                    raise ValueError("track effects must contain Effect objects")
+                for effect in track.effects:
+                    if not isinstance(effect.kind, str) or not isinstance(effect.parameters, dict):
+                        raise ValueError("track effect kind and parameters must be valid")
                 for clip in track.clips:
                     if not isinstance(clip, Clip):
                         raise ValueError("clips must contain Clip objects")
@@ -195,6 +202,10 @@ class Project:
                                 }
                                 for clip in track.clips
                             ],
+                            **({"effects": [
+                                {"kind": effect.kind, "parameters": effect.parameters}
+                                for effect in track.effects
+                            ]} if track.effects else {}),
                         }
                         for track in sequence.tracks
                     ],
@@ -225,7 +236,7 @@ class Project:
             _check_fields(item, {"id", "width", "height", "fps_num", "fps_den", "tracks"}, "sequence")
             tracks = []
             for track_data in item.get("tracks", []):
-                _check_fields(track_data, {"id", "kind", "clips"}, "track")
+                _check_fields(track_data, {"id", "kind", "clips", "effects"}, "track")
                 clips = []
                 for clip_data in track_data.get("clips", []):
                     _check_fields(
@@ -238,7 +249,11 @@ class Project:
                         for effect in clip_data.get("effects", [])
                     ]
                     clips.append(Clip(**{**clip_data, "effects": effects}))
-                tracks.append(Track(**{**track_data, "clips": clips}))
+                track_effects = [
+                    Effect(**_checked(effect, {"kind", "parameters"}, "track effect"))
+                    for effect in track_data.get("effects", [])
+                ]
+                tracks.append(Track(**{**track_data, "clips": clips, "effects": track_effects}))
             sequences.append(Sequence(**{**item, "tracks": tracks}))
         render_jobs = [
             RenderJob(**_checked(item, {"id", "sequence_id", "output_uri", "status"}, "render job"))
