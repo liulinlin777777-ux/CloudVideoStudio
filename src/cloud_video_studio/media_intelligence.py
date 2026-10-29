@@ -597,15 +597,25 @@ class MediaIntelligence:
         self._remaining(deadline)
         metadata = self._metadata(record, probe)
         video_stream = next(stream for stream in probe["streams"] if stream.get("codec_type") == "video")
+        format_start_time = _finite_number(probe["format"].get("start_time"))
+        if format_start_time is None:
+            format_start_time = 0.0
         source_time_origin = _finite_number(video_stream.get("start_time"))
         if source_time_origin is None:
-            source_time_origin = _finite_number(probe["format"].get("start_time")) or 0.0
-        duration = metadata["duration_seconds"]
-        analyzed_duration = min(duration, _ANALYSIS_SECONDS_LIMIT)
-        truncated_by_duration = duration > _ANALYSIS_SECONDS_LIMIT
+            source_time_origin = format_start_time
+        video_duration = _finite_positive(video_stream.get("duration"))
+        if video_duration is None:
+            container_end_time = format_start_time + metadata["duration_seconds"]
+            video_duration = _finite_positive(container_end_time - source_time_origin)
+        if video_duration is None:
+            video_duration = metadata["duration_seconds"]
+        analyzed_duration = min(video_duration, _ANALYSIS_SECONDS_LIMIT)
+        truncated_by_duration = video_duration > _ANALYSIS_SECONDS_LIMIT
+        seek_seconds = max(0.0, source_time_origin - format_start_time)
         scene_filter = f"select='gt(scene,{threshold:.3f})',metadata=print:file=-"
         scene_cmd = [
             self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+            "-ss", f"{seek_seconds:.6f}",
             "-t", f"{analyzed_duration:.6f}", "-i", str(source),
             "-map", "0:v:0", "-vf",
             f"setpts=PTS-STARTPTS,trim=duration={analyzed_duration:.6f},{scene_filter}",
@@ -647,6 +657,7 @@ class MediaIntelligence:
             )
             frame_cmd = [
                 self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+                "-ss", f"{seek_seconds:.6f}",
                 "-t", f"{analyzed_duration:.6f}", "-i", str(source),
                 "-map", "0:v:0", "-vf", frame_filter, "-an", "-sn", "-dn",
                 "-frames:v", str(output_count), "-fps_mode", "vfr", "-q:v", "3", "-threads", "1",

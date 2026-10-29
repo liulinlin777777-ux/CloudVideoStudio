@@ -359,6 +359,52 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertAlmostEqual(result["scenes"][1]["start_seconds"], 6.0, delta=0.15)
         self.assertEqual(len(result["keyframes"]), 2)
 
+    def test_scene_selection_uses_video_span_when_audio_starts_earlier(self):
+        clip = self.root / "five-scene-video.mp4"
+        delayed = self.root / "sixty-second-audio-lead.mp4"
+        colors = ("black", "white", "red", "blue", "green")
+        inputs = []
+        for color in colors:
+            inputs.extend(["-f", "lavfi", "-i", f"color=c={color}:s=96x64:r=10:d=2"])
+        concat = "".join(f"[{index}:v]" for index in range(len(colors)))
+        filter_complex = f"{concat}concat=n={len(colors)}:v=1:a=0,format=yuv420p[v]"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", *inputs,
+            "-filter_complex", filter_complex, "-map", "[v]", "-c:v", "libx264",
+            "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast", "-g", "10", str(clip),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, check=True)
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=70",
+            "-itsoffset", "60", "-i", str(clip), "-map", "1:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-avoid_negative_ts", "disabled", str(delayed),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, check=True)
+        probe = self.analyzer._probe(delayed, deadline=time.monotonic() + 30)
+        video = next(stream for stream in probe["streams"] if stream.get("codec_type") == "video")
+        self.assertAlmostEqual(float(video["start_time"]), 60.0, delta=0.15)
+        self.assertAlmostEqual(float(video["duration"]), 10.0, delta=0.15)
+        # FFprobe omits `profile` for this synthetic MP4 edit-list layout even
+        # though its H.264 SPS is present. Keep the test focused on timestamp
+        # handling: bypass only that importer comparison while retaining real
+        # FFprobe metadata, scene detection, and keyframe extraction.
+        with patch.object(self.store, "_inspect", return_value=self.asset["metadata"]):
+            delayed_asset = self.store.import_file(delayed)
+            result = self.analyzer.analyze(
+                delayed_asset["id"], scene_threshold=0.20, max_scenes=3,
+            )
+        sampled_offsets = [
+            scene["start_seconds"] - result["scenes"][0]["start_seconds"]
+            for scene in result["scenes"][1:]
+        ]
+        self.assertEqual(len(sampled_offsets), 3)
+        self.assertLess(sampled_offsets[0], 3.5)
+        self.assertGreater(sampled_offsets[-1], 6.5)
+        self.assertGreater(sampled_offsets[-1] - sampled_offsets[0], 5.0)
+        self.assertAlmostEqual(result["analyzed_duration_seconds"], 10.0, delta=0.15)
+
     def test_reanalysis_reserves_replacement_instead_of_double_counting_frames(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
         directory = self.store.root / "derivatives"
