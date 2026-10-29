@@ -131,6 +131,8 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
     if (not isinstance(data, dict) or data.get("schema_version") != _CACHE_SCHEMA
             or data.get("asset_id") != asset_id or data.get("source_sha256") != record.get("sha256")
             or not isinstance(data.get("scenes"), list) or not isinstance(data.get("metadata"), dict)
+            or data["metadata"].get("filename") != record.get("filename")
+            or data["metadata"].get("size_bytes") != record.get("size_bytes")
             or not isinstance(data.get("scene_detection"), dict)):
         return None
     keyframes = data.get("keyframes")
@@ -290,7 +292,14 @@ class MediaIntelligence:
         cached = _load_analysis(self.store, asset_id, record)
         if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
                 and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
-            return cached
+            publication = publication_lock if publication_lock is not None else self.store._lock
+            with publication:
+                with self.store._lock, self.store._process_lock():
+                    record, source = self._verified_asset_under_store_lock(asset_id)
+                    cached = _load_analysis(self.store, asset_id, record)
+                    if (cached and cached.get("scene_detection", {}).get("threshold") == threshold
+                            and cached.get("scene_detection", {}).get("max_scenes") == max_scenes):
+                        return cached
 
         probe = self._probe(source)
         metadata = self._metadata(record, probe)
@@ -396,28 +405,29 @@ class MediaIntelligence:
             encoded_cache_size = len(_cache_payload(result))
             publication = publication_lock if publication_lock is not None else self.store._lock
             with publication:
-                after, _ = self.store.verified_asset(asset_id, kind="video")
-                if after.get("sha256") != record.get("sha256") or after.get("path") != record.get("path"):
-                    raise MediaAnalysisError("video asset changed during analysis")
-                replacement_names = self._replaceable_analysis_files(directory, asset_id)
-                cache_path = _cache_path(self.store, asset_id)
-                try:
-                    cache_info = cache_path.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    if stat.S_ISREG(cache_info.st_mode) and cache_info.st_nlink == 1:
-                        replacement_names.add(cache_path.name)
-                self.store._check_derivative_total(
-                    replacing=replacement_names,
-                    additional_bytes=total_image_bytes + encoded_cache_size,
-                )
-                for image, name in prepared_images:
-                    os.replace(image, directory / name)
-                    new_keyframes.append(name)
-                self._write_cache(asset_id, result)
-                cache_committed = True
-                self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
+                with self.store._lock, self.store._process_lock():
+                    after, _ = self._verified_asset_under_store_lock(asset_id)
+                    if after.get("sha256") != record.get("sha256") or after.get("path") != record.get("path"):
+                        raise MediaAnalysisError("video asset changed during analysis")
+                    replacement_names = self._replaceable_analysis_files(directory, asset_id)
+                    cache_path = _cache_path(self.store, asset_id)
+                    try:
+                        cache_info = cache_path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if stat.S_ISREG(cache_info.st_mode) and cache_info.st_nlink == 1:
+                            replacement_names.add(cache_path.name)
+                    self.store._check_derivative_total(
+                        replacing=replacement_names,
+                        additional_bytes=total_image_bytes + encoded_cache_size,
+                    )
+                    for image, name in prepared_images:
+                        os.replace(image, directory / name)
+                        new_keyframes.append(name)
+                    self._write_cache(asset_id, result)
+                    cache_committed = True
+                    self.cleanup_stale_keyframes(asset_id, set(new_keyframes))
             return result
         except BaseException:
             if not cache_committed:
@@ -440,6 +450,15 @@ class MediaIntelligence:
             if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                 replaceable.add(path.name)
         return replaceable
+
+    def _verified_asset_under_store_lock(self, asset_id: str) -> tuple[dict[str, Any], Path]:
+        """Validate manifest and managed bytes while the caller owns both store locks."""
+        record = self.store._asset(asset_id)
+        if record["kind"] != "video":
+            raise ValueError("asset must be video")
+        source = self.store._managed_path(record)
+        self.store._verify_managed(source, record)
+        return dict(record), source
 
     def _probe(self, source: Path) -> dict[str, Any]:
         command = [

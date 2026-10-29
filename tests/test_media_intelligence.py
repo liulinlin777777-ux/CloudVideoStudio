@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import cloud_video_studio.assets as assets_module
+import cloud_video_studio.media_intelligence as media_module
 from cloud_video_studio.assets import AssetStore
 from cloud_video_studio.media_intelligence import (
     MediaAnalysisError,
@@ -170,6 +171,43 @@ class MediaIntelligenceTests(unittest.TestCase):
         linked = self.store.relink(self.asset["id"], alternate, filename="alternate.mp4")
         self.assertNotEqual(linked["sha256"], first["source_sha256"])
         self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+
+    def test_same_bytes_relink_refreshes_cached_filename_metadata(self):
+        first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        alternate = self.root / "renamed-source.mp4"
+        alternate.write_bytes(self.source.read_bytes())
+        linked = self.store.relink(self.asset["id"], alternate, filename="renamed-source.mp4")
+        self.assertEqual(linked["sha256"], first["source_sha256"])
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        refreshed = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertEqual(refreshed["metadata"]["filename"], "renamed-source.mp4")
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), refreshed)
+
+    def test_cache_hit_revalidates_after_a_concurrent_relink(self):
+        self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        alternate = self.root / "concurrent-relink.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=yellow:s=96x64:r=10:d=3",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(alternate),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, check=True)
+        original_load = media_module._load_analysis
+        relinked = False
+
+        def load_then_relink(store, asset_id, record):
+            nonlocal relinked
+            cached = original_load(store, asset_id, record)
+            if not relinked:
+                relinked = True
+                store.relink(asset_id, alternate, filename="concurrent-relink.mp4")
+            return cached
+
+        with patch.object(media_module, "_load_analysis", side_effect=load_then_relink):
+            result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertTrue(relinked)
+        self.assertEqual(result["metadata"]["filename"], "concurrent-relink.mp4")
+        self.assertEqual(result["source_sha256"], self.store.list_assets()[0]["sha256"])
 
     def test_search_and_cache_paths_are_bounded(self):
         with self.assertRaisesRegex(MediaAnalysisError, "invalid search query"):

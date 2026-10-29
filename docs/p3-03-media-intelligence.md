@@ -17,9 +17,12 @@ to a remote service.
 
 The library reuses the existing FFmpeg/FFprobe install, managed asset hashes,
 loopback host/origin checks, and derivative-store limits. No Python package or
-new media engine is added. The result cache records the source SHA-256 and is
-ignored when a relink changes that digest. Keyframe reads resolve through the
-validated per-asset analysis index, not a browser-provided path.
+new media engine is added. The result cache records the source SHA-256 and asset
+metadata, and is ignored when a relink changes the bytes or display name.
+Analysis revalidates the asset under the store's cross-process lock before
+returning a cache hit and holds that lock while replacing keyframes and cache.
+Keyframe reads resolve through the validated per-asset analysis index, not a
+browser-provided path.
 
 ## Limits and status
 
