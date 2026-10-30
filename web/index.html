@@ -3,9 +3,10 @@
 <main><small>P2-B · BOUNDED MULTI-TRACK · LOCAL CPU RENDER</small><h1>CloudVideoStudio</h1><p id="details">Loading timeline…</p><video id="preview" controls preload="metadata"></video><section><h2>Local media library</h2><p>Select media from this device. Files are copied to this loopback app; source files remain unchanged.</p><label>Choose media <input id="asset-files" type="file" multiple accept=".mp4,.mov,.mp3,.wav,.jpg,.jpeg,.png,.srt"></label><button id="import-assets">Import selected files</button><label>Search local media <input id="asset-search" type="search" placeholder="filename, codec, size, scene time"></label><div id="asset-library" aria-live="polite"></div></section><section id="creative-brief"><h2>P3-01 · Research and creative brief</h2><p>Enter the audience, goal, topic and source records for this project. Sources are user-entered; this local workflow does not fetch or verify URLs, invent citations, or publish content. Each factual claim must point to a saved source before approval.</p><div class="brief-grid"><label>Audience<input id="brief-audience" maxlength="1000"></label><label>Goal<input id="brief-goal" maxlength="1000"></label><label>Topic<input id="brief-topic" maxlength="1000"></label><label>Key message<input id="brief-key-message" maxlength="2000"></label><label>Tone<input id="brief-tone" maxlength="300"></label><label>Target duration (seconds)<input id="brief-duration" type="number" min="1" max="3600" step="1" value="60"></label><label>Constraints<textarea id="brief-constraints" maxlength="2000"></textarea></label></div><div class="brief-columns"><div><h3>Research sources</h3><div id="brief-sources" aria-live="polite"></div><button id="brief-add-source" type="button">Add source</button></div><div><h3>Factual claims and citations</h3><div id="brief-claims" aria-live="polite"></div><button id="brief-add-claim" type="button">Add cited claim</button></div></div><p><button id="brief-reload" type="button">Reload saved brief</button><button id="brief-save" type="button">Save draft</button><button id="brief-approve" type="button">Approve brief</button><span id="brief-status" role="status" aria-live="polite">Loading brief…</span></p></section><section><strong id="timeline-title">Timeline</strong><div><label>Timeline zoom <input id="zoom" type="range" min="1" max="8" value="1"></label><label>Destination track <select id="add-track"></select></label><button id="add-video-track">Add video track</button><button id="add-audio-track">Add audio track</button><label>Playhead frame <input id="playhead" type="number" min="0" step="1" value="0"></label><label>Snap tolerance <input id="snap" type="number" min="0" max="25" step="1" value="3"></label></div><div id="timeline"></div><h3>Select a clip</h3><div id="clip-choices" role="group" aria-label="Timeline clips"></div><div><label>Start frame <input id="start" type="number" min="0" step="1"></label><label>Source in frame <input id="source-in" type="number" min="0" step="1"></label><label>Duration frames <input id="duration" type="number" min="1" step="1"></label></div><div><button id="move">Apply move</button><button id="trim">Apply trim</button><button id="split">Split at playhead</button><button id="delete">Delete clip</button><button id="undo">Undo</button><button id="redo">Redo</button></div><div><button id="save">Save project</button><button id="load">Load saved project</button><button id="render">Render preview</button></div><p id="status" role="status" aria-live="polite">Loading project…</p></section><small>Bounded to four video tracks, four audio tracks, twenty clips, 60 seconds, 720p and the supported exact frame rates. Chrome, Safari, full decode and external media acceptance remain unverified.</small></main>
 <script>
 let project=null,selectedClip=null,dirty=false,busy=false,undoStack=[],redoStack=[];let assetRows=[],assetRefreshGeneration=0;const $=id=>document.getElementById(id);const sequence=()=>project.sequences[0];
-const analysisRevisions=new Map();
+const analysisRevisions=new Map(),pendingAnalyses=new Set();let analysisQueue=Promise.resolve(),activeAnalysisId=null;
 function analysisRevisionFor(assetId){return analysisRevisions.get(assetId)||0}
 function bumpAnalysisRevision(assetId){const revision=analysisRevisionFor(assetId)+1;analysisRevisions.set(assetId,revision);return revision}
+function syncAnalysisButton(row,asset){const analyze=row.querySelector('[data-analysis-button]');if(!analyze)return;const pending=pendingAnalyses.has(asset.id);analyze.textContent=activeAnalysisId===asset.id?'Analyzing scenes…':pending?'Queued for analysis…':asset.analysis?'Re-analyze scenes':'Analyze scenes';analyze.disabled=pending}
 function clips(){return sequence().tracks.flatMap(track=>track.clips.map(clip=>({track,clip})));}
 function totalFrames(){return Math.max(...clips().map(({clip})=>clip.start_frame+clip.duration_frames));}
 function status(message,error=false){$('status').textContent=message;$('status').classList.toggle('error',error)}
@@ -48,7 +49,7 @@ function filterAssetLibrary(){
 function assetSearchText(asset){const sceneTimes=(asset.analysis?.scenes||[]).filter(scene=>Number.isFinite(scene.start_seconds)).map(scene=>`${scene.start_seconds.toFixed(3)}s`).join(' ');return (JSON.stringify({filename:asset.filename,kind:asset.kind,size_bytes:asset.size_bytes,metadata:asset.metadata,analysis:asset.analysis||null})+' '+sceneTimes).toLowerCase()}
 function createAnalysisDetails(asset){
  if(!asset.analysis)return null;
- const details=document.createElement('details');details.dataset.analysisView='true';const summary=document.createElement('summary');summary.textContent=`${asset.analysis.metadata.width||'?'}×${asset.analysis.metadata.height||'?'} · ${asset.analysis.metadata.duration_seconds.toFixed(2)}s · ${asset.analysis.scene_detection.candidate_count} scene candidates`;details.append(summary);
+ const details=document.createElement('details');details.dataset.analysisView='true';const summary=document.createElement('summary');const metadata=asset.analysis.metadata,detection=asset.analysis.scene_detection;const notices=[];if(asset.analysis.duration_truncated)notices.push(`analyzed first ${asset.analysis.analyzed_duration_seconds.toFixed(2)}s of ${metadata.duration_seconds.toFixed(2)}s`);if(detection.truncated)notices.push(`showing ${Math.max(0,asset.analysis.scenes.length-1)} of ${detection.candidate_count} scene changes (cap ${detection.max_scenes})`);summary.textContent=`${metadata.width||'?'}×${metadata.height||'?'} · ${metadata.duration_seconds.toFixed(2)}s · ${detection.candidate_count} scene candidates${notices.length?` · ${notices.join(' · ')}`:''}`;details.append(summary);
  const list=document.createElement('ol');
  for(const scene of asset.analysis.scenes){
   const item=document.createElement('li');const score=scene.score===null?'opening frame':`score ${scene.score.toFixed(3)}`;item.textContent=`${scene.start_seconds.toFixed(3)}s · ${score}`;
@@ -59,29 +60,35 @@ function createAnalysisDetails(asset){
 function updateAssetAnalysisView(asset){
  const row=[...$('asset-library').children].find(item=>item.dataset.assetId===asset.id);if(!row)return;
  row.dataset.searchText=assetSearchText(asset);const metadata=row.querySelector('.asset-meta');if(metadata)metadata.textContent=formatAssetSummary(asset);
- const analyze=row.querySelector('[data-analysis-button]');if(analyze){analyze.textContent=asset.analysis?'Re-analyze scenes':'Analyze scenes';analyze.disabled=false}
+ syncAnalysisButton(row,asset);
  const previous=row.querySelector('[data-analysis-view]');const details=createAnalysisDetails(asset);
  if(previous&&details)previous.replaceWith(details);else if(previous)previous.remove();else if(details){const proxy=row.querySelector('[data-proxy-button]');row.insertBefore(details,proxy||null)}
  filterAssetLibrary()
 }
-async function analyzeAsset(asset,button){
- const sourceSha=asset.sha256,assetPath=asset.path,requestRevision=bumpAnalysisRevision(asset.id);button.disabled=true;status(`Analyzing ${asset.filename} locally…`);
- try{
-  const response=await fetch(`/assets/${asset.id}/analyze`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scene_threshold:0.35,max_scenes:24,force:Boolean(asset.analysis)})});let result;
-  try{result=await response.json()}catch{throw Error(`Analysis failed (HTTP ${response.status})`)}
-  if(!response.ok)throw Error(result.error||`HTTP ${response.status}`);
-  const current=assetRows.find(item=>item.id===asset.id);if(!current||current.sha256!==sourceSha||current.path!==assetPath||analysisRevisionFor(asset.id)!==requestRevision)return;
-  if(result.source_sha256!==sourceSha){bumpAnalysisRevision(asset.id);status('Analysis result was discarded because the media changed.');await refreshAssets();return}
-  bumpAnalysisRevision(asset.id);current.analysis=result;updateAssetAnalysisView(current);status(`Analysis complete · ${result.scene_detection.candidate_count} detected boundaries · ${result.scenes.length} keyframes`)
- }catch(error){
-  if(analysisRevisionFor(asset.id)!==requestRevision)return;
-  const revision=bumpAnalysisRevision(asset.id),current=assetRows.find(item=>item.id===asset.id);if(!current||current.sha256!==sourceSha||current.path!==assetPath)return;
-  current.analysis=null;updateAssetAnalysisView(current);
-  let latest=null;try{const response=await fetch(`/assets/${asset.id}/analysis`);if(response.ok)latest=await response.json()}catch{}
-  if(analysisRevisionFor(asset.id)!==revision)return;
-  const reconciled=assetRows.find(item=>item.id===asset.id);if(!reconciled||reconciled.sha256!==sourceSha||reconciled.path!==assetPath)return;
-  reconciled.analysis=latest&&latest.source_sha256===sourceSha?latest:null;updateAssetAnalysisView(reconciled);status(`Analysis failed: ${error.message}`,true)
- }
+async function analyzeAsset(asset){
+ if(pendingAnalyses.has(asset.id))return;
+ pendingAnalyses.add(asset.id);const sourceSha=asset.sha256,assetPath=asset.path,requestRevision=bumpAnalysisRevision(asset.id);const row=[...$('asset-library').children].find(item=>item.dataset.assetId===asset.id);if(row)syncAnalysisButton(row,asset);status(`Queued ${asset.filename} for local analysis…`);
+ const queued=analysisQueue.then(async()=>{
+  try{
+   const source=assetRows.find(item=>item.id===asset.id);if(!source||source.sha256!==sourceSha||source.path!==assetPath||analysisRevisionFor(asset.id)!==requestRevision)return;
+   activeAnalysisId=asset.id;const activeRow=[...$('asset-library').children].find(item=>item.dataset.assetId===asset.id);if(activeRow)syncAnalysisButton(activeRow,source);status(`Analyzing ${source.filename} locally…`);
+   const response=await fetch(`/assets/${asset.id}/analyze`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scene_threshold:0.35,max_scenes:24,force:Boolean(source.analysis)})});let result;
+   try{result=await response.json()}catch{throw Error(`Analysis failed (HTTP ${response.status})`)}
+   if(!response.ok)throw Error(result.error||`HTTP ${response.status}`);
+   const current=assetRows.find(item=>item.id===asset.id);if(!current||current.sha256!==sourceSha||current.path!==assetPath||analysisRevisionFor(asset.id)!==requestRevision)return;
+   if(result.source_sha256!==sourceSha){bumpAnalysisRevision(asset.id);status('Analysis result was discarded because the media changed.');await refreshAssets();return}
+   bumpAnalysisRevision(asset.id);current.analysis=result;updateAssetAnalysisView(current);status(`Analysis complete · ${result.scene_detection.candidate_count} detected boundaries · ${result.scenes.length} keyframes`)
+  }catch(error){
+   if(analysisRevisionFor(asset.id)!==requestRevision)return;
+   const revision=bumpAnalysisRevision(asset.id),current=assetRows.find(item=>item.id===asset.id);if(!current||current.sha256!==sourceSha||current.path!==assetPath)return;
+   current.analysis=null;updateAssetAnalysisView(current);
+   let latest=null;try{const response=await fetch(`/assets/${asset.id}/analysis`);if(response.ok)latest=await response.json()}catch{}
+   if(analysisRevisionFor(asset.id)!==revision)return;
+   const reconciled=assetRows.find(item=>item.id===asset.id);if(!reconciled||reconciled.sha256!==sourceSha||reconciled.path!==assetPath)return;
+   reconciled.analysis=latest&&latest.source_sha256===sourceSha?latest:null;updateAssetAnalysisView(reconciled);status(`Analysis failed: ${error.message}`,true)
+  }finally{if(activeAnalysisId===asset.id)activeAnalysisId=null;pendingAnalyses.delete(asset.id);const current=assetRows.find(item=>item.id===asset.id);if(current)updateAssetAnalysisView(current)}
+ });
+ analysisQueue=queued.catch(()=>{});await queued
 }
 function drawAssetLibrary(){
  const library=$('asset-library');library.replaceChildren();
@@ -96,8 +103,8 @@ function drawAssetLibrary(){
    const image=document.createElement('img');image.src=`/assets/${asset.id}/thumbnail`;image.alt=`Thumbnail for ${asset.filename}`;image.width=160;image.loading='lazy';row.append(image)
   }
   if(asset.kind==='video'){
-   const analyze=document.createElement('button');analyze.type='button';analyze.dataset.analysisButton='true';analyze.textContent=asset.analysis?'Re-analyze scenes':'Analyze scenes';analyze.onclick=()=>analyzeAsset(asset,analyze);
-   row.append(analyze);
+   const analyze=document.createElement('button');analyze.type='button';analyze.dataset.analysisButton='true';analyze.onclick=()=>analyzeAsset(asset);
+   row.append(analyze);syncAnalysisButton(row,asset);
    const details=createAnalysisDetails(asset);if(details)row.append(details)
    const play=document.createElement('button');play.type='button';play.dataset.proxyButton='true';play.textContent='Generate and play proxy';const proxy=document.createElement('video');proxy.controls=true;proxy.hidden=true;play.onclick=()=>{proxy.src=`/assets/${asset.id}/proxy`;proxy.hidden=false;proxy.load()};row.append(play,proxy)
   }

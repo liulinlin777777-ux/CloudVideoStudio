@@ -65,7 +65,11 @@ class AssetStore:
         root: str | Path,
         max_file_bytes: int = _DEFAULT_FILE_LIMIT,
         max_total_bytes: int = _DEFAULT_TOTAL_LIMIT,
+        ffprobe: str = "ffprobe",
     ) -> None:
+        if not isinstance(ffprobe, str) or not ffprobe:
+            raise ValueError("ffprobe executable must be a non-empty string")
+        self.ffprobe = ffprobe
         self.root = Path(os.path.abspath(Path(root).expanduser()))
         self._reject_symlink_ancestors(self.root)
         with _STORE_LOCKS_GUARD:
@@ -259,7 +263,7 @@ class AssetStore:
             raise
         result = self._check_derivative(target, "video/mp4", output_limit)
         try:
-            probe = _ffprobe(target)
+            probe = _ffprobe(target, executable=self.ffprobe)
         except ValueError:
             target.unlink(missing_ok=True)
             raise
@@ -336,8 +340,7 @@ class AssetStore:
         if result.returncode:
             raise ValueError(f"{operation} failed")
 
-    @staticmethod
-    def _check_derivative(path: Path, content_type: str, maximum: int) -> dict[str, Any]:
+    def _check_derivative(self, path: Path, content_type: str, maximum: int) -> dict[str, Any]:
         try:
             size = path.stat().st_size
         except OSError as exc:
@@ -350,7 +353,7 @@ class AssetStore:
                 valid = image.read(3) == b"\xff\xd8\xff"
         else:
             try:
-                probe = _ffprobe(path)
+                probe = _ffprobe(path, executable=self.ffprobe)
             except ValueError:
                 path.unlink(missing_ok=True)
                 raise
@@ -506,7 +509,7 @@ class AssetStore:
                 raise ValueError("file extension does not match PNG content")
             if suffix in {".jpg", ".jpeg"} and not header.startswith(b"\xff\xd8\xff"):
                 raise ValueError("file extension does not match JPEG content")
-        probe = probe_data if probe_data is not None else _ffprobe(source)
+        probe = probe_data if probe_data is not None else _ffprobe(source, executable=self.ffprobe)
         streams = probe.get("streams")
         if not isinstance(streams, list) or not streams:
             raise ValueError("FFprobe found no media streams")
@@ -733,10 +736,10 @@ def _validate_srt(path: Path, max_bytes: int) -> dict[str, Any]:
     return {"encoding": "utf-8", "cue_count": len(blocks), "duration_seconds": max_end / 1000}
 
 
-def _ffprobe(path: Path) -> dict[str, Any]:
+def _ffprobe(path: Path, *, executable: str = "ffprobe") -> dict[str, Any]:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
+            [executable, "-v", "error", "-show_entries",
              "format=format_name,duration:stream=index,codec_type,codec_name,profile,width,height,duration,avg_frame_rate,r_frame_rate,sample_rate,channels",
              "-show_format", "-show_streams", "-of", "json", str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

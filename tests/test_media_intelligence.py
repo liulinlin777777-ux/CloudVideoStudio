@@ -205,6 +205,54 @@ class MediaIntelligenceTests(unittest.TestCase):
         self.assertNotEqual(second["analysis_id"], first["analysis_id"])
         self.assertEqual(get_analysis(self.store, self.asset["id"]), second)
 
+    def test_malformed_scene_and_detection_metadata_are_rejected(self):
+        result = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"
+        record = self.store._asset(self.asset["id"])
+        mutations = (
+            lambda data: data["scenes"].__setitem__(0, None),
+            lambda data: data["scenes"][0].__setitem__("start_seconds", float("nan")),
+            lambda data: data["scene_detection"].__setitem__("threshold", float("nan")),
+            lambda data: data["scene_detection"].__setitem__("candidate_count", -1),
+            lambda data: data["metadata"].__setitem__("duration_seconds", "corrupt"),
+            lambda data: data.__setitem__("duration_truncated", "false"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                corrupted = json.loads(json.dumps(result))
+                mutate(corrupted)
+                cache.write_text(json.dumps(corrupted, allow_nan=True), encoding="utf-8")
+                self.assertIsNone(media_module._load_analysis(self.store, self.asset["id"], record))
+
+        corrupt_metadata = json.loads(json.dumps(result))
+        corrupt_metadata["metadata"]["duration_seconds"] = "corrupt"
+        cache.write_text(json.dumps(corrupt_metadata), encoding="utf-8")
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        recovered_metadata = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertNotEqual(recovered_metadata["analysis_id"], result["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), recovered_metadata)
+
+        corrupt_scene = json.loads(json.dumps(result))
+        corrupt_scene["scenes"][0] = None
+        cache.write_text(json.dumps(corrupt_scene), encoding="utf-8")
+        self.assertIsNone(get_analysis(self.store, self.asset["id"]))
+        recovered = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        self.assertNotEqual(recovered["analysis_id"], result["analysis_id"])
+        self.assertEqual(get_analysis(self.store, self.asset["id"]), recovered)
+
+    def test_cache_directory_failure_rolls_back_this_runs_keyframes(self):
+        derivatives = self.store.root / "derivatives"
+        derivatives.mkdir(parents=True, exist_ok=True)
+        cache = derivatives / f"{self.asset['id']}-analysis.json"
+        cache.mkdir()
+        before = set(derivatives.glob(f"{self.asset['id']}-analysis-*.jpg"))
+        with self.assertRaises((OSError, MediaAnalysisError)):
+            self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
+        after = set(derivatives.glob(f"{self.asset['id']}-analysis-*.jpg"))
+        self.assertEqual(after, before)
+        self.assertTrue(cache.is_dir())
+        self.store._check_derivative_total()
+
     def test_previous_cache_schema_is_reanalyzed(self):
         first = self.analyzer.analyze(self.asset["id"], scene_threshold=0.20)
         cache = self.store.root / "derivatives" / f"{self.asset['id']}-analysis.json"

@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -289,9 +290,19 @@ class AssetStoreTests(unittest.TestCase):
                 self.skipTest("installed FFmpeg cannot encode the synthetic H.264 fixture")
             original = source.read_bytes()
             original_hash = hashlib.sha256(original).hexdigest()
+            real_ffprobe = shutil.which("ffprobe")
+            self.assertIsNotNone(real_ffprobe)
+            custom_ffprobe = root / "custom-ffprobe"
+            custom_ffprobe.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(real_ffprobe)} \"$@\"\n", encoding="utf-8",
+            )
+            custom_ffprobe.chmod(0o755)
+            isolated_path = root / "empty-path"
+            isolated_path.mkdir()
             store = AssetStore(root / "store", max_file_bytes=2 * 1024 * 1024,
-                               max_total_bytes=4 * 1024 * 1024)
-            asset = store.import_file(source)
+                               max_total_bytes=4 * 1024 * 1024, ffprobe=str(custom_ffprobe))
+            with patch.dict(os.environ, {"PATH": str(isolated_path)}):
+                asset = store.import_file(source)
             self.assertEqual(asset["sha256"], original_hash)
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
             self.assertEqual(AssetStore(root / "store").list_assets()[0], asset)

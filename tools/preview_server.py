@@ -36,7 +36,8 @@ MAX_BODY = 65536
 MAX_BRIEF_BODY = MAX_ARTIFACT_BYTES + 4096
 MAX_UPLOAD = 512 * 1024 * 1024
 upload_slots = threading.BoundedSemaphore(2)
-asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024)
+asset_store = AssetStore(root / 'assets', max_file_bytes=MAX_UPLOAD, max_total_bytes=2 * 1024 * 1024 * 1024,
+                         ffprobe=a.ffprobe)
 media_intelligence = MediaIntelligence(asset_store, ffmpeg=a.ffmpeg, ffprobe=a.ffprobe)
 
 
@@ -167,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
             thumbnail_match = re.fullmatch(r'/assets/([0-9a-f]{32})/thumbnail', route)
             if thumbnail_match:
                 with asset_lock:
-                    derivative = asset_store.create_thumbnail(thumbnail_match.group(1))
+                    derivative = asset_store.create_thumbnail(thumbnail_match.group(1), ffmpeg=a.ffmpeg)
                     path = asset_store.root / derivative['path']
                     return self.reply(200, path.read_bytes(), 'image/jpeg')
             proxy_match = re.fullmatch(r'/assets/([0-9a-f]{32})/proxy', route)

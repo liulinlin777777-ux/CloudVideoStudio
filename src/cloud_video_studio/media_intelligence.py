@@ -243,6 +243,52 @@ def _cache_path(store: AssetStore, asset_id: str) -> Path:
     return path
 
 
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _is_positive_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_cached_metadata(metadata: dict[str, Any], record: dict[str, Any]) -> bool:
+    """Reject cache metadata that could break the browser summary renderer."""
+    record_metadata = record.get("metadata")
+    if not isinstance(record_metadata, dict):
+        return False
+    duration = metadata.get("duration_seconds")
+    if not _is_finite_number(duration) or duration <= 0:
+        return False
+    if (not _is_positive_integer(metadata.get("width"))
+            or not _is_positive_integer(metadata.get("height"))
+            or metadata.get("width") != record_metadata.get("width")
+            or metadata.get("height") != record_metadata.get("height")):
+        return False
+    streams = metadata.get("streams")
+    if not isinstance(streams, list) or not streams or len(streams) > 64:
+        return False
+    for stream in streams:
+        if not isinstance(stream, dict) or not isinstance(stream.get("type"), str):
+            return False
+        stream_duration = stream.get("duration_seconds")
+        if stream_duration is not None and (not _is_finite_number(stream_duration) or stream_duration <= 0):
+            return False
+        for key in ("width", "height", "sample_rate", "channels", "bit_rate"):
+            value = stream.get(key)
+            if value is not None and not _is_positive_integer(value):
+                return False
+        fps = stream.get("fps")
+        if fps is not None and (not isinstance(fps, list) or len(fps) != 2
+                                or any(not _is_positive_integer(value) for value in fps)):
+            return False
+    return any(stream.get("type") == "video" for stream in streams)
+
+
 def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> dict[str, Any] | None:
     path = _cache_path(store, asset_id)
     try:
@@ -264,6 +310,21 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
             or data["metadata"].get("size_bytes") != record.get("size_bytes")
             or not isinstance(data.get("scene_detection"), dict)):
         return None
+    if not _valid_cached_metadata(data["metadata"], record):
+        return None
+    detection = data["scene_detection"]
+    analyzed_duration = data.get("analyzed_duration_seconds")
+    threshold = detection.get("threshold")
+    max_scenes = detection.get("max_scenes")
+    candidate_count = detection.get("candidate_count")
+    if (not _is_finite_number(analyzed_duration) or not 0 < analyzed_duration <= _ANALYSIS_SECONDS_LIMIT
+            or not isinstance(data.get("duration_truncated"), bool)
+            or not _is_finite_number(threshold) or not 0 < threshold < 1
+            or isinstance(max_scenes, bool) or not isinstance(max_scenes, int)
+            or not 1 <= max_scenes <= _SCENE_COUNT_LIMIT
+            or isinstance(candidate_count, bool) or not isinstance(candidate_count, int)
+            or candidate_count < 0 or not isinstance(detection.get("truncated"), bool)):
+        return None
     keyframes = data.get("keyframes")
     if not isinstance(keyframes, list) or not 1 <= len(keyframes) <= _KEYFRAME_COUNT_LIMIT:
         return None
@@ -274,6 +335,20 @@ def _load_analysis(store: AssetStore, asset_id: str, record: dict[str, Any]) -> 
         return None
     if len(data["scenes"]) != len(keyframes):
         return None
+    if candidate_count < len(data["scenes"]) - 1:
+        return None
+    for index, scene in enumerate(data["scenes"]):
+        if (not isinstance(scene, dict) or isinstance(scene.get("index"), bool)
+                or not isinstance(scene.get("index"), int) or scene["index"] != index
+                or not _is_finite_number(scene.get("start_seconds"))):
+            return None
+        score = scene.get("score")
+        if index == 0:
+            if score is not None:
+                return None
+        elif (not _is_finite_number(score) or not 0 <= score <= 1
+                or isinstance(scene.get("pts"), bool) or not isinstance(scene.get("pts"), int)):
+            return None
     for index, name in enumerate(keyframes):
         expected = f"{asset_id}-analysis-{run_id}-{index:03d}.jpg"
         image = path.parent / expected
@@ -821,29 +896,30 @@ class MediaIntelligence:
                 except FileNotFoundError:
                     pass
                 else:
-                    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                            or before.st_size <= 0 or before.st_size > _CACHE_BYTES_LIMIT):
-                        return
-                    descriptor = os.open(
-                        cache_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    )
-                    try:
-                        opened = os.fstat(descriptor)
-                        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
-                                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
-                            return
-                        payload = os.read(descriptor, _CACHE_BYTES_LIMIT + 1)
-                    finally:
-                        os.close(descriptor)
-                    if len(payload) > _CACHE_BYTES_LIMIT:
-                        return
-                    try:
-                        current_cache = json.loads(payload.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        return
-                    if (not isinstance(current_cache, dict)
-                            or not isinstance(current_cache.get("keyframes"), list)):
-                        return
+                    if (stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                            and 0 < before.st_size <= _CACHE_BYTES_LIMIT):
+                        try:
+                            descriptor = os.open(
+                                cache_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                        except OSError:
+                            descriptor = None
+                        if descriptor is not None:
+                            try:
+                                opened = os.fstat(descriptor)
+                                if (stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                                        and (opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino)):
+                                    payload = os.read(descriptor, _CACHE_BYTES_LIMIT + 1)
+                                    if len(payload) <= _CACHE_BYTES_LIMIT:
+                                        try:
+                                            decoded = json.loads(payload.decode("utf-8"))
+                                        except (UnicodeDecodeError, json.JSONDecodeError):
+                                            decoded = None
+                                        if (isinstance(decoded, dict)
+                                                and isinstance(decoded.get("keyframes"), list)):
+                                            current_cache = decoded
+                            finally:
+                                os.close(descriptor)
 
                 current_keyframes = {
                     name for name in (current_cache or {}).get("keyframes", [])
