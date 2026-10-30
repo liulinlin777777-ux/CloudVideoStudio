@@ -11,6 +11,7 @@ class PreviewContract(unittest.TestCase):
   cls.tmp=tempfile.TemporaryDirectory();cls.root=Path(cls.tmp.name);cls.port=18774
   with patch.object(sys,'argv',['preview_server.py','--media-root',str(cls.root),'--port',str(cls.port)]),patch('http.server.ThreadingHTTPServer'):
    module=runpy.run_path('tools/preview_server.py',run_name='preview_contract')
+  cls.server_globals=module
   cls.handler=module['Handler']
  @classmethod
  def tearDownClass(cls):cls.tmp.cleanup()
@@ -75,3 +76,38 @@ class PreviewContract(unittest.TestCase):
   p=self.project();p['sequences'][0]['fps_num']=25;p['sequences'][0]['fps_den']=1
   code,b=self.edit(p,'move','tone880-clip',start_frame=35);self.assertEqual(code,200,b)
   self.assertEqual(b['project']['sequences'][0]['fps_num'],25)
+
+ def test_media_search_and_analysis_routes_keep_loopback_and_asset_scope(self):
+  self.assertEqual(self.request('/assets/search?q=clip')[0],404)
+  self.assertEqual(self.request('/assets/search',{'q':'clip'})[0],403)
+  self.assertEqual(self.request('/assets/search',{'q':'clip'},origin='https://evil.example')[0],403)
+  same_origin=f'http://127.0.0.1:{self.port}'
+  code,body=self.request('/assets/search',{'q':'clip'},origin=same_origin)
+  self.assertEqual(code,200,body);self.assertEqual(body,{'assets':[]})
+  self.assertEqual(self.request('/assets/search',{'q':'x'*121},origin=same_origin)[0],400)
+  self.assertEqual(self.request('/assets/search',{'q':'clip','extra':True},origin=same_origin)[0],400)
+  from unittest.mock import patch
+  asset_id='a'*32
+  body={'scene_threshold':0.35,'max_scenes':24}
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin='https://evil.example')[0],403)
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',body,origin=f'http://127.0.0.1:{self.port}')[0],400)
+  self.assertEqual(self.request(f'/assets/{asset_id}/analyze',{'force':1},origin=f'http://127.0.0.1:{self.port}')[0],400)
+  self.assertIn(self.request(f'/assets/{asset_id}/keyframes/0')[0],[400,404])
+  self.assertEqual(self.request(f'/assets/{asset_id}/keyframes/0?analysis_id=not-a-version')[0],400)
+  with patch.dict(self.handler.do_GET.__globals__, {'read_keyframe': lambda store, requested_id, index, *, analysis_id:
+                                       b'\xff\xd8\xff' if (requested_id, index, analysis_id) ==
+                                       (asset_id, 0, 'a' * 12) else b'wrong'}):
+   code,body=self.request(f'/assets/{asset_id}/keyframes/0?analysis_id='+('a'*12))
+  self.assertEqual((code,body),(200,b'\xff\xd8\xff'))
+ def test_media_analysis_does_not_hold_asset_lock_during_decode(self):
+  from unittest.mock import patch
+  lock=self.server_globals['asset_lock']; analyzer=self.server_globals['media_intelligence']
+  def fake_analyze(asset_id,**kwargs):
+   self.assertFalse(lock._is_owned())
+   self.assertIs(kwargs['publication_lock'],lock)
+   self.assertIs(kwargs['force'],True)
+   return {'keyframes':[],'scenes':[],'scene_detection':{'candidate_count':0}}
+  with patch.object(analyzer,'analyze',side_effect=fake_analyze):
+   code,body=self.request('/assets/'+('a'*32)+'/analyze',{'scene_threshold':0.35,'force':True},
+                          origin=f'http://127.0.0.1:{self.port}')
+  self.assertEqual(code,200,body)

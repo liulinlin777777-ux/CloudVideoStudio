@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 import fcntl
 from contextlib import contextmanager
@@ -63,7 +65,11 @@ class AssetStore:
         root: str | Path,
         max_file_bytes: int = _DEFAULT_FILE_LIMIT,
         max_total_bytes: int = _DEFAULT_TOTAL_LIMIT,
+        ffprobe: str = "ffprobe",
     ) -> None:
+        if not isinstance(ffprobe, str) or not ffprobe:
+            raise ValueError("ffprobe executable must be a non-empty string")
+        self.ffprobe = ffprobe
         self.root = Path(os.path.abspath(Path(root).expanduser()))
         self._reject_symlink_ancestors(self.root)
         with _STORE_LOCKS_GUARD:
@@ -125,18 +131,37 @@ class AssetStore:
                 raise ValueError("symlink path ancestors are not accepted")
 
     @contextmanager
-    def _process_lock(self):
+    def _process_lock(self, timeout: float | None = None):
+        if (timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                     or not math.isfinite(timeout) or timeout < 0)):
+            raise ValueError("asset lock timeout must be finite and non-negative")
         if self.lockfile.is_symlink():
             raise ValueError("asset lock must not be a symlink")
         descriptor = os.open(self.lockfile, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        acquired = False
         try:
             lock_info = os.fstat(descriptor)
             if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1:
                 raise ValueError("asset lock must be a regular, unaliased file")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if timeout is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                acquired = True
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("asset store lock deadline exceeded")
+                        time.sleep(min(0.01, remaining))
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
     @staticmethod
@@ -185,6 +210,16 @@ class AssetStore:
         return [dict(item) for item in self._read_manifest()]
 
     @_store_transaction
+    def verified_asset(self, asset_id: str, *, kind: str | None = None) -> tuple[dict[str, Any], Path]:
+        """Return a managed asset only after checking its bytes and probe metadata."""
+        record = self._asset(asset_id)
+        if kind is not None and record["kind"] != kind:
+            raise ValueError(f"asset must be {kind}")
+        path = self._managed_path(record)
+        self._verify_managed(path, record)
+        return dict(record), path
+
+    @_store_transaction
     def create_thumbnail(self, asset_id: str, *, ffmpeg: str = "ffmpeg", timeout: float = 20) -> dict[str, Any]:
         """Create a small JPEG derivative for a validated video or still image."""
         record = self._asset(asset_id)
@@ -228,7 +263,7 @@ class AssetStore:
             raise
         result = self._check_derivative(target, "video/mp4", output_limit)
         try:
-            probe = _ffprobe(target)
+            probe = _ffprobe(target, executable=self.ffprobe)
         except ValueError:
             target.unlink(missing_ok=True)
             raise
@@ -275,10 +310,22 @@ class AssetStore:
             raise ValueError("asset derivative storage limit exceeded")
         return min(per_file_limit, available)
 
-    def _check_derivative_total(self) -> None:
+    def _check_derivative_total(
+        self,
+        *,
+        replacing: set[str] | None = None,
+        additional_bytes: int = 0,
+    ) -> None:
+        if (isinstance(additional_bytes, bool) or not isinstance(additional_bytes, int)
+                or additional_bytes < 0):
+            raise ValueError("invalid derivative size reservation")
+        excluded = replacing or set()
+        if (not isinstance(excluded, set)
+                or any(not isinstance(name, str) or Path(name).name != name for name in excluded)):
+            raise ValueError("invalid derivative replacement list")
         used = sum(path.stat().st_size for path in (self.root / "derivatives").iterdir()
-                   if path.is_file() and not path.is_symlink())
-        if used > _DERIVATIVE_TOTAL_LIMIT:
+                   if path.is_file() and not path.is_symlink() and path.name not in excluded)
+        if used + additional_bytes > _DERIVATIVE_TOTAL_LIMIT:
             raise ValueError("asset derivative storage limit exceeded")
 
     @staticmethod
@@ -293,8 +340,7 @@ class AssetStore:
         if result.returncode:
             raise ValueError(f"{operation} failed")
 
-    @staticmethod
-    def _check_derivative(path: Path, content_type: str, maximum: int) -> dict[str, Any]:
+    def _check_derivative(self, path: Path, content_type: str, maximum: int) -> dict[str, Any]:
         try:
             size = path.stat().st_size
         except OSError as exc:
@@ -307,7 +353,7 @@ class AssetStore:
                 valid = image.read(3) == b"\xff\xd8\xff"
         else:
             try:
-                probe = _ffprobe(path)
+                probe = _ffprobe(path, executable=self.ffprobe)
             except ValueError:
                 path.unlink(missing_ok=True)
                 raise
@@ -370,10 +416,44 @@ class AssetStore:
                 old_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            cleanup_pending = False
+            try:
+                self._remove_analysis_derivatives(asset_id)
+            except (OSError, ValueError):
+                cleanup_pending = True
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        return dict(record)
+        result = dict(record)
+        result["analysis_cleanup_pending"] = cleanup_pending
+        return result
+
+    def _remove_analysis_derivatives(self, asset_id: str) -> None:
+        """Discard cached analysis files before a relinked record is published."""
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise ValueError("invalid asset id")
+        directory = self.root / "derivatives"
+        try:
+            directory_info = directory.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise ValueError("asset derivative directory must be a real directory")
+        cache_name = f"{asset_id}-analysis.json"
+        keyframe_name = re.compile(
+            rf"{re.escape(asset_id)}-analysis-[0-9a-f]{{12}}-\d{{3}}\.jpg"
+        )
+        for derivative in directory.iterdir():
+            if derivative.name != cache_name and not keyframe_name.fullmatch(derivative.name):
+                continue
+            try:
+                info = derivative.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                derivative.unlink(missing_ok=True)
+            else:
+                raise ValueError("analysis derivative is not a regular file")
 
     def _source(self, path: str | Path) -> tuple[Path, int]:
         source = Path(path).expanduser().absolute()
@@ -416,7 +496,9 @@ class AssetStore:
             "metadata_version": 1,
         }
 
-    def _inspect(self, source: Path, kind: str) -> dict[str, Any]:
+    def _inspect(
+        self, source: Path, kind: str, *, probe_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if kind == "subtitle":
             return _validate_srt(source, self.max_file_bytes)
         suffix = source.suffix.lower()
@@ -427,7 +509,7 @@ class AssetStore:
                 raise ValueError("file extension does not match PNG content")
             if suffix in {".jpg", ".jpeg"} and not header.startswith(b"\xff\xd8\xff"):
                 raise ValueError("file extension does not match JPEG content")
-        probe = _ffprobe(source)
+        probe = probe_data if probe_data is not None else _ffprobe(source, executable=self.ffprobe)
         streams = probe.get("streams")
         if not isinstance(streams, list) or not streams:
             raise ValueError("FFprobe found no media streams")
@@ -654,10 +736,10 @@ def _validate_srt(path: Path, max_bytes: int) -> dict[str, Any]:
     return {"encoding": "utf-8", "cue_count": len(blocks), "duration_seconds": max_end / 1000}
 
 
-def _ffprobe(path: Path) -> dict[str, Any]:
+def _ffprobe(path: Path, *, executable: str = "ffprobe") -> dict[str, Any]:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
+            [executable, "-v", "error", "-show_entries",
              "format=format_name,duration:stream=index,codec_type,codec_name,profile,width,height,duration,avg_frame_rate,r_frame_rate,sample_rate,channels",
              "-show_format", "-show_streams", "-of", "json", str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
